@@ -1,7 +1,7 @@
 {
   "version": "1.0.5",
   "minVersion": "1.0.0",
-  "forceUpdate": false,
+  "forceUpdate": true,
   "changelog": [
     "Faster data syncing",
     "Bug fixes and stability improvements",
