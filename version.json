@@ -1,0 +1,10 @@
+{
+  "version": "1.0.5",
+  "minVersion": "1.0.0",
+  "forceUpdate": false,
+  "changelog": [
+    "Faster data syncing",
+    "Bug fixes and stability improvements",
+    "UI polish and design refinements"
+  ]
+}
