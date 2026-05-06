@@ -24,7 +24,6 @@ import Animated, {
   FadeInRight,
   FadeOut,
   interpolate,
-  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
@@ -263,7 +262,7 @@ const CriticalAttendanceCarousel = ({ items }: { items: any[] }) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     flip.value = withTiming(dir * -90, { duration: 180 }, () => {
       const updateIndex = (idx: number) => { setCurrentIndex(idx); };
-      runOnJS(updateIndex)(next); // NOSONAR
+      updateIndex(next); // NOSONAR
       flip.value = dir * 90;
       flip.value = withTiming(0, { duration: 180 });
     });
@@ -579,6 +578,9 @@ export default function DashboardScreen() {
   const confirmLogout = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     setShowLogoutModal(false);
+    // ✅ Bug 1 Fix: reset the guard so session-expiry modal can fire again
+    // if the user logs back in within the same app lifecycle
+    hasHandledSessionExpired.current = false;
     AsyncStorage.clear().then(() => router.replace('/'));
   }, [router]);
 
@@ -587,11 +589,24 @@ export default function DashboardScreen() {
     setShowLogoutModal(false);
   }, []);
 
+  // Keys that hold scraped academic data — cleared on session expiry so
+  // the user sees fresh data after re-login (user_netid is kept so the
+  // login screen can pre-fill / greet the user).
+  const SESSION_DATA_KEYS = [
+    'academic_data',
+    'timetable_data',
+    'academic_calendar_data',
+    'student_profile_data',
+    'attendance_data_v2',
+  ] as const;
+
   const handleSessionExpired = useCallback(() => {
     if (hasHandledSessionExpired.current) return;
     hasHandledSessionExpired.current = true;
     setShowSessionAlert(true);
-    AsyncStorage.clear().catch(() => {});
+    // ✅ Design Issue 4 Fix: only wipe data keys, keep user_netid so login
+    // screen can show who was previously logged in
+    AsyncStorage.multiRemove([...SESSION_DATA_KEYS]).catch(() => {});
   }, []);
 
   const confirmSessionLogOut = useCallback(() => {
@@ -708,11 +723,9 @@ export default function DashboardScreen() {
             </Text>
 
             <Text style={styles.updateSub}>
-              {availableVersion
-                ? `You're on v${currentAppVersion}. v${availableVersion} is now live on Google Play.${
-                    forceUpdate ? ' Please update to continue using the app.' : ''
-                  }`
-                : 'A newer build is available on Google Play.'}
+              {!availableVersion && 'A newer build is available on Google Play.'}
+              {availableVersion && `You're on v${currentAppVersion}. v${availableVersion} is now live on Google Play.`}
+              {availableVersion && forceUpdate && ' Please update to continue using the app.'}
             </Text>
 
             {/* Changelog items (dynamic from version.json) */}
@@ -723,7 +736,7 @@ export default function DashboardScreen() {
                   const tints = [COLORS.warningTint, COLORS.dangerTint, COLORS.brandTint];
                   const colors = [COLORS.warning, COLORS.danger, COLORS.brandLight];
                   return (
-                    <View key={idx.toString()} style={styles.updateFeatureItem}>
+                    <View key={item} style={styles.updateFeatureItem}>
                       <View style={[styles.updateFeatureIconWrap, { backgroundColor: tints[idx % 3] }]}>
                         <Ionicons name={icons[idx % 3]} size={16} color={colors[idx % 3]} />
                       </View>
@@ -765,29 +778,6 @@ export default function DashboardScreen() {
           </Animated.View>
         </View>
       </Modal>
-
-      {/* ─── CUSTOM LOGOUT MODAL ────────────────────────────────────── */}
-      {showLogoutModal && (
-        <Animated.View entering={FadeIn.duration(200)} exiting={FadeOut.duration(200)} style={styles.modalOverlay}>
-          <View style={styles.modalBackdrop} />
-          <Animated.View entering={FadeInDown.duration(300).springify().damping(16)} style={styles.modalCard}>
-            <View style={styles.modalIconRing}>
-              <Ionicons name="log-out" size={28} color={COLORS.danger} style={{ marginLeft: 4 }} />
-            </View>
-            <Text style={styles.modalTitle}>Sign Out</Text>
-            <Text style={styles.modalSub}>Are you sure you want to disconnect your account?</Text>
-
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={styles.modalBtnCancel} onPress={cancelLogout}>
-                <Text style={styles.modalBtnCancelText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.modalBtnConfirm} onPress={confirmLogout} activeOpacity={0.8}>
-                <Text style={styles.modalBtnConfirmText}>Log Out</Text>
-              </TouchableOpacity>
-            </View>
-          </Animated.View>
-        </Animated.View>
-      )}
 
       <SafeAreaView style={{ flex: 1 }} edges={['top']}>
         <ScrollView
@@ -982,6 +972,7 @@ export default function DashboardScreen() {
             <SRMTimeTableScraper
               backgroundMode
               onScrapeComplete={handleTimetableScrapeComplete}
+              onSessionExpired={handleSessionExpired}
             />
             <SRMAcademicReportScraper
               backgroundMode
@@ -990,10 +981,12 @@ export default function DashboardScreen() {
             <SRMAttendanceScraper
               backgroundMode
               onScrapeComplete={handleAttendanceScrapeComplete}
+              onSessionExpired={handleSessionExpired}
             />
             <SRMMarksScraper
               backgroundMode
               onScrapeComplete={handleMarksScrapeComplete}
+              onSessionExpired={handleSessionExpired}
             />
             <SRMProfileScraper
               backgroundMode
@@ -1007,6 +1000,31 @@ export default function DashboardScreen() {
         {/* ─────────────────────────────────────────────────────────── */}
 
       </SafeAreaView>
+
+      {/* ─── CUSTOM LOGOUT MODAL ────────────────────────────────────────── */}
+      {/* ✅ Design Issue 3 Fix: both custom modals now live outside SafeAreaView  */}
+      {/* at the same JSX depth, guaranteeing consistent overlay behaviour.        */}
+      {showLogoutModal && (
+        <Animated.View entering={FadeIn.duration(200)} exiting={FadeOut.duration(200)} style={styles.modalOverlay}>
+          <View style={styles.modalBackdrop} />
+          <Animated.View entering={FadeInDown.duration(300).springify().damping(16)} style={styles.modalCard}>
+            <View style={styles.modalIconRing}>
+              <Ionicons name="log-out" size={28} color={COLORS.danger} style={{ marginLeft: 4 }} />
+            </View>
+            <Text style={styles.modalTitle}>Sign Out</Text>
+            <Text style={styles.modalSub}>Are you sure you want to disconnect your account?</Text>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={styles.modalBtnCancel} onPress={cancelLogout}>
+                <Text style={styles.modalBtnCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalBtnConfirm} onPress={confirmLogout} activeOpacity={0.8}>
+                <Text style={styles.modalBtnConfirmText}>Log Out</Text>
+              </TouchableOpacity>
+            </View>
+          </Animated.View>
+        </Animated.View>
+      )}
 
       {/* ─── SESSION EXPIRED MODAL ─────────────────────────────────────── */}
       {showSessionAlert && (

@@ -377,6 +377,9 @@ const INJECTION_SCRIPT = String.raw`
       });
     } catch (_) {}
 
+    const evens = dynamic.filter(function(h) { return /even/i.test(h); });
+    if (evens.length > 0) return unique(evens);
+
     return unique(dynamic.concat([
       'Academic_Planner_2025_26_EVEN'
     ]));
@@ -394,16 +397,15 @@ const INJECTION_SCRIPT = String.raw`
     return !!(el && el.offsetParent !== null);
   }
 
-  function isExactPlanner2025Even(el) {
+  function isEvenPlanner(el) {
     if (!isVisible(el)) return false;
     var text = normalizedText(el);
     var href = (el.getAttribute('href') || '').toLowerCase();
     var id   = (el.getAttribute('id') || '').toLowerCase();
     return (
-      text.includes('planner 2025 26 even') ||
-      text.includes('academic planner 2025 26 even') ||
-      href.includes('academic_planner_2025_26_even') ||
-      id.includes('academic_planner_2025_26_even')
+      text.includes('even') ||
+      href.includes('even') ||
+      id.includes('even')
     );
   }
 
@@ -427,8 +429,7 @@ const INJECTION_SCRIPT = String.raw`
       var href = (el.getAttribute('href') || '').toLowerCase();
       var id   = (el.getAttribute('id') || '').toLowerCase();
       return isVisible(el) && (
-        text.includes('planner 2025 26 even') ||
-        text.includes('academic planner 2025 26 even') ||
+        text.includes('even') ||
         text.includes('academic planner') ||
         text.includes('academic calendar') ||
         href.includes('academic_planner') ||
@@ -452,11 +453,13 @@ const INJECTION_SCRIPT = String.raw`
 
   function findPlannerElement() {
     var leaves = findPlannerMenuItems();
-    var exact = leaves.find(isExactPlanner2025Even);
+    var exact = leaves.find(isEvenPlanner);
     if (exact) return exact;
 
-    // Only choose the second visible planner option if the exact entry
-    // is not detectable. This keeps us pinned to the middle button.
+    // Fallback: return any item with 'even', or just the middle item
+    var anyEven = leaves.find(function(el) { return normalizedText(el).includes('even'); });
+    if (anyEven) return anyEven;
+    
     return leaves.length > 1 ? leaves[1] : (leaves[0] || null);
   }
 
@@ -467,7 +470,7 @@ const INJECTION_SCRIPT = String.raw`
 
     const directEl = findPlannerElement();
     if (directEl) {
-      log('Click nav: Academic Planner 2025_26_EVEN');
+      log('Click nav: Even Planner');
       click(directEl);
       lastActivity = Date.now();
       return;
@@ -481,7 +484,7 @@ const INJECTION_SCRIPT = String.raw`
       setTimeout(function () {
         var submenuTarget = findPlannerElement();
         if (submenuTarget) {
-          log('Click submenu: Planner 2025_26_EVEN');
+          log('Click submenu: Even Planner');
           click(submenuTarget);
           lastActivity = Date.now();
         }

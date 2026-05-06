@@ -24,6 +24,7 @@ interface SRMMarksScraperProps {
   refreshIntervalHours?: number; // default: 2
   maxRetries?: number;           // default: 3
   scrapeTimeoutMs?: number;      // default: 70000
+  onSessionExpired?: () => void;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -308,7 +309,10 @@ const SRMMarksScraper: React.FC<SRMMarksScraperProps> = ({
   refreshIntervalHours = DEFAULT_REFRESH_H,
   maxRetries           = DEFAULT_RETRIES,
   scrapeTimeoutMs      = DEFAULT_TIMEOUT_MS,
+  onSessionExpired,
 }) => {
+  const onSessionExpiredRef = useRef(onSessionExpired);
+  useEffect(() => { onSessionExpiredRef.current = onSessionExpired; }, [onSessionExpired]);
   const webViewRef   = useRef<WebView>(null);
   const timeoutRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const watchdogRef  = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -428,8 +432,11 @@ const SRMMarksScraper: React.FC<SRMMarksScraperProps> = ({
         case 'ERROR':
           if (p.message === 'SESSION_EXPIRED') {
             clearTimers();
+            console.warn('[Marks] Session expired — user logged out from another device.');
             setStep('Session expired — please log in');
             setIsDone(true);
+            // Notify parent so dashboard can show the re-login modal
+            if (onSessionExpiredRef.current) onSessionExpiredRef.current();
           }
           break;
       }

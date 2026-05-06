@@ -18,16 +18,14 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Application from 'expo-application';
 import Constants from 'expo-constants';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Platform } from 'react-native';
+import { Platform, Linking } from 'react-native';
 
 import {
-  ANDROID_PACKAGE,
   CURRENT_VERSION,
   PLAY_STORE_DEEP_LINK,
   PLAY_STORE_WEB_URL,
   VERSION_CHECK_URL,
 } from '../constants/AppVersion';
-import { Linking } from 'react-native';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface VersionManifest {
@@ -161,13 +159,16 @@ export function useUpdateCheck(): UpdateState {
         return;
       }
 
-      // Persist successful check timestamp
-      await AsyncStorage.setItem(LAST_CHECK_KEY, String(Date.now()));
-
       const needsUpdate = compareSemver(currentVersion, manifest.version) < 0;
+      const isForced = manifest.forceUpdate ?? false;
+
+      // Persist successful check timestamp ONLY if it's not a forced update.
+      // This prevents users from bypassing forced updates by force-closing the app.
+      if (!needsUpdate || !isForced) {
+        await AsyncStorage.setItem(LAST_CHECK_KEY, String(Date.now()));
+      }
 
       if (needsUpdate) {
-        const isForced = manifest.forceUpdate ?? false;
         setAvailableVersion(manifest.version);
         setChangelog(manifest.changelog ?? []);
         setForceUpdate(isForced);

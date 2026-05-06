@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Stack, useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -194,16 +194,19 @@ function useProfileLayout(width: number, height: number) {
 }
 
 // ── Scraper View ─────────────────────────────────────────────────────────────
-const ProfileScraperView = ({ sessionDead, onSessionExpired, onScrapeComplete }: Readonly<{
-  sessionDead: boolean;
+// sessionDead prop removed: session expiry now redirects to login immediately
+// via handleSessionExpired, so we never need to reveal the WebView for re-login.
+// showInternalAlert={false}: parent owns all session-expiry UX — no double alert.
+const ProfileScraperView = ({ onSessionExpired, onScrapeComplete }: Readonly<{
   onSessionExpired: () => void;
   onScrapeComplete: (data: any) => void;
 }>) => (
   <View style={{ flex: 1, backgroundColor: C.bg }}>
     <Stack.Screen options={{ title: 'Academia Login', headerBackTitle: 'Back' }} />
-    {!sessionDead && <LoadingWave />} 
+    <LoadingWave />
     <SRMProfileScraper
-      backgroundMode={true} 
+      backgroundMode={true}
+      showInternalAlert={false}
       onSessionExpired={onSessionExpired}
       onScrapeComplete={onScrapeComplete}
     />
@@ -231,12 +234,32 @@ export default function ProfileScreen() {
 
   const [loading, setLoading]             = useState(true);
   const [needsScraping, setNeedsScraping] = useState(false);
-  const [sessionDead, setSessionDead]     = useState(false); // 🔥 NEW: Controls LoadingWave visibility
   const [netId, setNetId]                 = useState('User');
   const [profileData, setProfileData]     = useState<{
     name: string; registerNumber: string; imageUrl: string;
   } | null>(null);
   const [imageError, setImageError]       = useState(false);
+
+  // ✅ Design Issue 1 Fix: guard ref prevents duplicate session-expired firings
+  const hasHandledSessionExpired = useRef(false);
+
+  // ✅ Design Issue 1 Fix: proper session expiry handler — clears cached
+  // academic data and redirects to the app login screen
+  const SESSION_DATA_KEYS = [
+    'academic_data',
+    'timetable_data',
+    'academic_calendar_data',
+    'student_profile_data',
+    'attendance_data_v2',
+  ] as const;
+
+  const handleSessionExpired = useCallback(() => {
+    if (hasHandledSessionExpired.current) return;
+    hasHandledSessionExpired.current = true;
+    // Wipe scraped data; keep user_netid so login screen can greet the user
+    AsyncStorage.multiRemove([...SESSION_DATA_KEYS]).catch(() => {});
+    router.replace('/');
+  }, [router]);
 
   useEffect(() => {
     let alive = true;
@@ -274,13 +297,11 @@ export default function ProfileScreen() {
   if (needsScraping) {
     return (
       <ProfileScraperView
-        sessionDead={sessionDead}
-        onSessionExpired={() => setSessionDead(true)}
+        onSessionExpired={handleSessionExpired}
         onScrapeComplete={async (data) => {
           await AsyncStorage.setItem('student_profile_data', JSON.stringify(data));
           setProfileData(data);
           setNeedsScraping(false);
-          setSessionDead(false);
         }}
       />
     );

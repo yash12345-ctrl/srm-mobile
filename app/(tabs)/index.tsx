@@ -431,10 +431,16 @@ export default function LoginScreen() {
         AsyncStorage.getItem('academic_data'),
         AsyncStorage.getItem('user_netid'),
       ]);
-      if (storedData || storedId) {
+      
+      // Auto-login only if academic data exists (session active)
+      if (storedData) {
         await SplashScreen.hideAsync();
         router.replace('/dashboard');
       } else {
+        // If no data but ID exists (e.g., session expired), prefill the ID
+        if (storedId) {
+          setNetId(storedId);
+        }
         setCheckingAuth(false);
         await SplashScreen.hideAsync();
       }

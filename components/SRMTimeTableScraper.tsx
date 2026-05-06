@@ -1,14 +1,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, AppState, StyleSheet, Text, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 
 interface SRMTimeTableScraperProps {
   onScrapeComplete: (data: { batch: number, courses: any[], lastUpdated?: string }) => void;
   backgroundMode?: boolean;
+  onSessionExpired?: () => void;
 }
 
-const SRMTimeTableScraper: React.FC<SRMTimeTableScraperProps> = ({ onScrapeComplete, backgroundMode = false }) => {
+const SRMTimeTableScraper: React.FC<SRMTimeTableScraperProps> = ({ onScrapeComplete, backgroundMode = false, onSessionExpired }) => {
+  const onSessionExpiredRef = useRef(onSessionExpired);
+  useEffect(() => { onSessionExpiredRef.current = onSessionExpired; }, [onSessionExpired]);
   const [currentStep, setCurrentStep] = useState("Checking saved timetable...");
   const [isCheckingCache, setIsCheckingCache] = useState(true);
   const [isDone, setIsDone] = useState(false);
@@ -293,9 +296,30 @@ const SRMTimeTableScraper: React.FC<SRMTimeTableScraperProps> = ({ onScrapeCompl
         return false;
       }
 
+      // ── Session-expiry detection ──────────────────────────────────────────────
+      function isOnLoginPage() {
+        var url = window.location.href;
+        return (
+          url.includes('accounts.zoho') ||
+          url.includes('/login') ||
+          url.includes('signin') ||
+          !!document.querySelector('#login_id') ||
+          !!document.querySelector('iframe#signinFrame')
+        );
+      }
+
       // ── Watchdog — runs every 8 s ─────────────────────────────────────────────
       var watchdogInterval = setInterval(function() {
         if (state.done) { clearInterval(watchdogInterval); return; }
+
+        // Session expiry: college kicked us back to login page
+        if (isOnLoginPage()) {
+          clearInterval(watchdogInterval);
+          clearInterval(pollInterval);
+          clearInterval(iframeInterval);
+          post('SESSION_EXPIRED', {});
+          return;
+        }
 
         var bodyText = (document.body ? document.body.innerText : '').toLowerCase();
 
@@ -312,8 +336,8 @@ const SRMTimeTableScraper: React.FC<SRMTimeTableScraperProps> = ({ onScrapeCompl
 
         if (timeSinceNav > state.NAV_TIMEOUT || !state.navAttempted) {
           state.retryCount++;
-          state.navAttempted = false;          // reset so tryScrape will nav again
-          state.navStrategy  = Math.min(state.navStrategy + 1, 2); // escalate strategy
+          state.navAttempted = false;
+          state.navStrategy  = Math.min(state.navStrategy + 1, 2);
           log('🔄 Watchdog retry #' + state.retryCount + ' (strategy ' + state.navStrategy + ')…');
           tryScrape();
         }
@@ -381,9 +405,13 @@ const SRMTimeTableScraper: React.FC<SRMTimeTableScraperProps> = ({ onScrapeCompl
         onMessage={(event) => {
           try {
             const payload = JSON.parse(event.nativeEvent.data);
-            if (payload.type === 'LOG')   setCurrentStep(payload.message);
+            if (payload.type === 'LOG')     setCurrentStep(payload.message);
             if (payload.type === 'SUCCESS') handleScrapeSuccess(payload.data);
             if (payload.type === 'STUCK')   setCurrentStep(payload.message);
+            if (payload.type === 'SESSION_EXPIRED') {
+              console.warn('[Timetable] Session expired — user logged out from another device.');
+              if (onSessionExpiredRef.current) onSessionExpiredRef.current();
+            }
           } catch (e) {
             console.debug('[Timetable] Ignored unparseable WebView message:', e);
           }

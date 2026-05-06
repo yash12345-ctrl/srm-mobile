@@ -7,6 +7,7 @@ interface SRMAttendanceScraperProps {
   onScrapeComplete: (attendanceData: any) => void;
   onStepChange?: (step: string) => void;
   backgroundMode?: boolean;
+  onSessionExpired?: () => void;
 }
 
 const COOLDOWN_HOURS = 2;
@@ -17,7 +18,10 @@ const SRMAttendanceScraper: React.FC<SRMAttendanceScraperProps> = ({
   onScrapeComplete,
   onStepChange,
   backgroundMode = false,
+  onSessionExpired,
 }) => {
+  const onSessionExpiredRef = useRef(onSessionExpired);
+  useEffect(() => { onSessionExpiredRef.current = onSessionExpired; }, [onSessionExpired]);
   const webViewRef = useRef<WebView>(null);
   const onScrapeCompleteRef = useRef(onScrapeComplete);
 
@@ -213,6 +217,20 @@ const SRMAttendanceScraper: React.FC<SRMAttendanceScraperProps> = ({
         );
       }
 
+      // Detects if the WebView has been redirected back to the login page,
+      // meaning the user's college session was terminated from another device/browser.
+      function isOnLoginPage() {
+        var url = window.location.href;
+        return (
+          url.includes('accounts.zoho') ||
+          url.includes('/login') ||
+          url.includes('signin') ||
+          !!document.querySelector('#login_id') ||
+          !!document.querySelector('iframe#signinFrame') ||
+          !!document.querySelector('input[type="password"][id="password"]')
+        );
+      }
+
       function hasAttendanceTable(doc) {
         var txt = (doc.body ? doc.body.innerText : '').toLowerCase();
         if (txt.includes('course code') && (txt.includes('conducted') || txt.includes('attended'))) return true;
@@ -369,6 +387,17 @@ const SRMAttendanceScraper: React.FC<SRMAttendanceScraperProps> = ({
       // Watchdog — escalates nav strategy every 6 s
       var watchdog = setInterval(function() {
         if (S.done) { clearInterval(watchdog); return; }
+
+        // ── Session expiry check: if we are on the login page, the college
+        // session was killed from another browser/device. Notify RN immediately.
+        if (!isLoggedIn() && isOnLoginPage()) {
+          clearInterval(watchdog);
+          clearInterval(poll);
+          clearInterval(iframePoll);
+          post('SESSION_EXPIRED', {});
+          return;
+        }
+
         if (hasAttendanceTable(document)) return;
         if (S.navRetries >= S.MAX_NAV_RETRIES) {
           clearInterval(watchdog);
@@ -453,6 +482,10 @@ const SRMAttendanceScraper: React.FC<SRMAttendanceScraperProps> = ({
             if (payload.type === 'LOG')     setCurrentStep(payload.message);
             if (payload.type === 'SUCCESS') handleScrapeSuccess(payload.data);
             if (payload.type === 'STUCK')   setCurrentStep(payload.message);
+            if (payload.type === 'SESSION_EXPIRED') {
+              console.warn('[Attendance] Session expired — user logged out from another device.');
+              if (onSessionExpiredRef.current) onSessionExpiredRef.current();
+            }
           } catch (err) {
             console.debug('[Attendance] Ignored unparseable message or logic error:', err);
           }

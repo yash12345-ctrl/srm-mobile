@@ -303,6 +303,8 @@ const SRMProfileScraper: React.FC<SRMProfileScraperProps> = ({
   }, [shouldRevealWebView]);
 
   // ── Silent background session probe ───────────────────────────────────────
+  // ✅ Bug 3 Fix: reduced from 12 000 ms → 5 000 ms so a dead session is
+  // detected and the expiry modal fires within ~5 s instead of ~12 s.
   useEffect(() => {
     if (isDone || isCheckingCache || !backgroundMode) return;
 
@@ -310,7 +312,7 @@ const SRMProfileScraper: React.FC<SRMProfileScraperProps> = ({
       if (!isDone) {
         probeCurrentSession();
       }
-    }, 12000); 
+    }, 5000);
 
     return () => clearTimeout(probeTimer);
   }, [isDone, isCheckingCache, backgroundMode, scraperKey, probeCurrentSession]);
