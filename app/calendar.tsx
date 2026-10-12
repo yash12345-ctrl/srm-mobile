@@ -1,11 +1,13 @@
 import { Ionicons } from '@expo/vector-icons';
-import { router, Stack } from 'expo-router';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { router, Stack, useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Dimensions,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -26,8 +28,9 @@ import Animated, {
   withTiming
 } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import SRMAcademicReportScraper from '../components/SRMAcademicReportScraper';
-
+import { fetchScrapedData } from '../utils/api';
+import { isCalendarStale, recordCalendarFetched } from '../utils/cachePolicy';
+import { SkeletonBlock } from '../components/Skeleton';
 const { width } = Dimensions.get('window');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +200,7 @@ const LoadingWave = () => {
 // ─────────────────────────────────────────────────────────────────────────────
 export default function CalendarScreen() {
   const [calendarData, setCalendarData] = useState<{ monthNames: string[]; monthsData: any[][], lastUpdated?: string } | null>(null);
+  const [hasPortalPassword, setHasPortalPassword] = useState(true);
   const [currentMonthIndex, setCurrentMonthIndex] = useState(0);
   
   // Sync Indicator
@@ -207,21 +211,56 @@ export default function CalendarScreen() {
   const currentMonthShort = new Date().toLocaleString('en-US', { month: 'short' });
   const currentMonthLong  = new Date().toLocaleString('en-US', { month: 'long' });
 
-  const handleScrapeComplete = (data: { monthNames: string[]; monthsData: any[][], lastUpdated?: string }) => {
-    setCalendarData(data);
-    const mIndex = data.monthNames.findIndex(m => m.includes(currentMonthShort) || m.includes(currentMonthLong));
+  const handleScrapeComplete = (data: any) => {
+    let calendarData = data.calendar || data;
+    
+    // --- NEW FORMAT SUPPORT ---
+    if (calendarData.rows && !calendarData.monthNames) {
+      const monthMap = new Map<string, any[]>();
+      calendarData.rows.forEach((row: any) => {
+        if (!row.date) return;
+        const parts = row.date.split('-');
+        let d = NaN, m = NaN, y = NaN;
+        if (parts.length === 3) {
+            if (parts[0].length === 4) { // YYYY-MM-DD
+                y = parseInt(parts[0], 10); m = parseInt(parts[1], 10) - 1; d = parseInt(parts[2], 10);
+            } else { // DD-MM-YYYY
+                d = parseInt(parts[0], 10); m = parseInt(parts[1], 10) - 1; y = parseInt(parts[2], 10);
+            }
+        } else {
+            const dt = new Date(row.date);
+            if (!isNaN(dt.getTime())) { y = dt.getFullYear(); m = dt.getMonth(); d = dt.getDate(); }
+        }
+        
+        if (!isNaN(y)) {
+           const dateObj = new Date(y, m, d);
+           const monthName = dateObj.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+           if (!monthMap.has(monthName)) monthMap.set(monthName, []);
+           monthMap.get(monthName)!.push({
+               date: d.toString(),
+               day: row.day,
+               event: (row.remarks && row.remarks !== '-') ? row.remarks : row.status,
+               dayOrder: row.dayOrder
+           });
+        }
+      });
+      calendarData = {
+          monthNames: Array.from(monthMap.keys()),
+          monthsData: Array.from(monthMap.values()),
+          lastUpdated: calendarData.lastUpdated
+      };
+    }
+    
+    if (!calendarData || !calendarData.monthNames) return;
+    setCalendarData(calendarData);
+    AsyncStorage.setItem('academic_calendar_data', JSON.stringify(data)).catch(() => {});
+    const mIndex = calendarData.monthNames.findIndex((m: string) => m.includes(currentMonthShort) || m.includes(currentMonthLong));
     setCurrentMonthIndex(mIndex === -1 ? 0 : mIndex);
     
     if (data.lastUpdated) {
-        const ageInMs = Date.now() - new Date(data.lastUpdated).getTime();
-        if (ageInMs < 5000) {
-            setLastUpdatedLabel("Just now");
-            setIsSyncing(false);
-        } else {
-            setLastUpdatedLabel(formatTime(data.lastUpdated));
-            setIsSyncing(true);
-        }
+      setLastUpdatedLabel(formatTime(data.lastUpdated));
     }
+    setIsSyncing(false);
   };
 
   const handlePrevMonth = () => {
@@ -246,6 +285,76 @@ export default function CalendarScreen() {
   const scrollViewRef = useRef<ScrollView>(null);
   const [slideDir, setSlideDir] = useState<'left' | 'right'>('left');
   const [monthKey, setMonthKey] = useState(0); 
+  const [refreshing, setRefreshing] = useState(false);
+
+  const fetchCalendar = useCallback(async (force: boolean = false) => {
+    try {
+      const portalPass = await AsyncStorage.getItem('portal_password');
+      if (!portalPass) {
+        setHasPortalPassword(false);
+        setIsSyncing(false);
+        setRefreshing(false);
+        return;
+      }
+      setHasPortalPassword(true);
+      setIsSyncing(true);
+      const data = await fetchScrapedData('calendar/login', { forceSync: force });
+      handleScrapeComplete(data);
+      recordCalendarFetched();
+    } catch (e: any) {
+      if (e.message !== 'PORTAL_PASSWORD_REQUIRED') {
+        console.error(e);
+      }
+    } finally {
+      setIsSyncing(false);
+      setRefreshing(false);
+    }
+  }, []);
+
+  const loadCachedCalendar = useCallback(async () => {
+    try {
+      const portalPass = await AsyncStorage.getItem('portal_password');
+      setHasPortalPassword(Boolean(portalPass));
+
+      const cached = await AsyncStorage.getItem('academic_calendar_data');
+      const hasCached = !!cached;
+      if (cached) {
+        try {
+          handleScrapeComplete(JSON.parse(cached));
+        } catch {}
+      }
+
+      // Only call backend if cache missing OR not yet fetched today (morning sync)
+      if (portalPass) {
+        const isStale = await isCalendarStale();
+        if (!hasCached || isStale) {
+          fetchCalendar(false);
+        } else {
+          setIsSyncing(false);
+        }
+      } else {
+        setIsSyncing(false);
+      }
+    } catch (e) {
+      console.error(e);
+      setIsSyncing(false);
+    }
+  }, [fetchCalendar]);
+
+  useEffect(() => {
+    loadCachedCalendar();
+  }, [loadCachedCalendar]);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadCachedCalendar();
+    }, [loadCachedCalendar])
+  );
+
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    fetchCalendar(true);
+  }, [fetchCalendar]);
 
   const goToMonth = useCallback((dir: 'prev' | 'next') => {
     setSlideDir(dir === 'next' ? 'left' : 'right');
@@ -271,56 +380,82 @@ export default function CalendarScreen() {
       <Stack.Screen options={{ headerShown: false }} />
       <StatusBar barStyle="dark-content" backgroundColor={T.bg} />
 
-      <SRMAcademicReportScraper
-        backgroundMode={true}
-        onScrapeComplete={handleScrapeComplete}
-      />
+      {/* Scraper moved to backend */}
 
-      {calendarData ? (
+      {/* ── HEADER ───────────────────────────────────────────────────────── */}
+      <Animated.View entering={FadeInDown.duration(350)} style={styles.header}>
+        <Pressable
+          style={({ pressed }) => [styles.backBtn, pressed && { opacity: 0.5 }]}
+          onPress={() => router.back()}
+        >
+          <Ionicons name="chevron-back" size={20} color={T.textDark} />
+        </Pressable>
+
+        <View style={styles.headerCenter}>
+          <Text style={styles.headerTitle} numberOfLines={1}>Academic Calendar</Text>
+          <View style={styles.syncPill}>
+            {isSyncing ? (
+              <>
+                <ActivityIndicator size="small" color={T.textLight} style={{ transform: [{ scale: 0.7 }] }} />
+                <Text style={styles.syncText}>
+                  Syncing... (Last: {lastUpdatedLabel})
+                </Text>
+              </>
+            ) : hasPortalPassword ? (
+              <>
+                <Ionicons name="checkmark-circle" size={12} color={T.success} />
+                <Text style={[styles.syncText, { color: T.success }]}>
+                  Up to date
+                </Text>
+              </>
+            ) : (
+              <Text style={styles.syncText}>Setup Required</Text>
+            )}
+          </View>
+        </View>
+
+        <Pressable
+          onPress={jumpToToday}
+          style={({ pressed }) => [styles.todayBtn, pressed && { opacity: 0.6 }]}
+        >
+          <Ionicons name="today-outline" size={15} color={T.primary} />
+          <Text style={styles.todayBtnText}>Today</Text>
+        </Pressable>
+      </Animated.View>
+
+      {!calendarData && !hasPortalPassword ? (
+        <View style={styles.portalSetupWrap}>
+          <Animated.View entering={FadeInDown.delay(100).springify()} style={styles.portalSetupCard}>
+            <View style={styles.portalSetupIconWrap}>
+              <Ionicons name="key-outline" size={32} color={T.primary} />
+            </View>
+            <Text style={styles.portalSetupTitle}>Student Portal Setup Required</Text>
+            <Text style={styles.portalSetupSub}>
+              To view your academic calendar and class schedule, please go to Attendance and enter your Student Portal credentials once.
+            </Text>
+            <Pressable
+              style={({ pressed }) => [styles.portalSetupBtn, pressed && { opacity: 0.85 }]}
+              onPress={() => router.push('/attendance')}
+            >
+              <Ionicons name="clipboard-outline" size={18} color="#FFFFFF" />
+              <Text style={styles.portalSetupBtnText}>Go to Attendance</Text>
+              <Ionicons name="arrow-forward" size={16} color="#FFFFFF" />
+            </Pressable>
+          </Animated.View>
+        </View>
+      ) : calendarData ? (
         <ScrollView
           ref={scrollViewRef}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: 48 }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              tintColor={T.primary}
+            />
+          }
         >
-          {/* ── HEADER ───────────────────────────────────────────────────────── */}
-          <Animated.View entering={FadeInDown.duration(350)} style={styles.header}>
-            <Pressable
-              style={({ pressed }) => [styles.backBtn, pressed && { opacity: 0.5 }]}
-              onPress={() => router.back()}
-            >
-              <Ionicons name="chevron-back" size={20} color={T.textDark} />
-            </Pressable>
-
-            <View style={styles.headerCenter}>
-              <Text style={styles.headerTitle} numberOfLines={1}>Academic Calendar</Text>
-              <View style={styles.syncPill}>
-                {isSyncing ? (
-                  <>
-                    <ActivityIndicator size="small" color={T.textLight} style={{ transform: [{ scale: 0.7 }] }} />
-                    <Text style={styles.syncText}>
-                      Syncing... (Last: {lastUpdatedLabel})
-                    </Text>
-                  </>
-                ) : (
-                  <>
-                    <Ionicons name="checkmark-circle" size={12} color={T.success} />
-                    <Text style={[styles.syncText, { color: T.success }]}>
-                      Up to date
-                    </Text>
-                  </>
-                )}
-              </View>
-            </View>
-
-            <Pressable
-              onPress={jumpToToday}
-              style={({ pressed }) => [styles.todayBtn, pressed && { opacity: 0.6 }]}
-            >
-              <Ionicons name="today-outline" size={15} color={T.primary} />
-              <Text style={styles.todayBtnText}>Today</Text>
-            </Pressable>
-          </Animated.View>
-
           {/* ── TODAY WIDGET ─────────────────────────────────────────────────── */}
           {todayData && (() => {
             const type = eventType(todayData.event, todayData.day);
@@ -429,7 +564,15 @@ export default function CalendarScreen() {
 
           </ScrollView>
       ) : (
-        <LoadingWave />
+        <View style={{ padding: 16, gap: 12, marginTop: 40 }}>
+            <SkeletonBlock style={{ height: 100, borderRadius: 20 }} />
+            <SkeletonBlock style={{ height: 50, borderRadius: 16, marginTop: 10 }} />
+            <SkeletonBlock style={{ height: 50, borderRadius: 16 }} />
+            <SkeletonBlock style={{ height: 50, borderRadius: 16 }} />
+            <SkeletonBlock style={{ height: 50, borderRadius: 16 }} />
+            <SkeletonBlock style={{ height: 50, borderRadius: 16 }} />
+            <SkeletonBlock style={{ height: 50, borderRadius: 16 }} />
+        </View>
       )}
     </SafeAreaView>
   );
@@ -447,7 +590,7 @@ const styles = StyleSheet.create({
 
   // ── LOADING WAVE STYLES ───────────────────────────────────────────────
   loadingWaveContainer: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: T.bg,
@@ -804,5 +947,73 @@ const styles = StyleSheet.create({
   doValue: {
     fontSize: 15,
     fontWeight: '900',
+  },
+
+  // ── Portal Setup Card ──────────────────────────────────────────
+  portalSetupWrap: {
+    paddingHorizontal: 16,
+    paddingTop: 40,
+  },
+  portalSetupCard: {
+    backgroundColor: T.surface,
+    borderRadius: 24,
+    padding: 24,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: T.borderLight,
+    shadowColor: T.shadow,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.08,
+    shadowRadius: 16,
+    elevation: 3,
+  },
+  portalSetupIconWrap: {
+    width: 64,
+    height: 64,
+    borderRadius: 20,
+    backgroundColor: T.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: T.primary + '25',
+  },
+  portalSetupTitle: {
+    fontSize: 19,
+    fontWeight: '800',
+    color: T.textDark,
+    fontFamily: FONT.display,
+    letterSpacing: -0.4,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  portalSetupSub: {
+    fontSize: 14,
+    color: T.textMid,
+    textAlign: 'center',
+    lineHeight: 21,
+    marginBottom: 20,
+    paddingHorizontal: 8,
+  },
+  portalSetupBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: T.primary,
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    borderRadius: 16,
+    width: '100%',
+    shadowColor: T.primary,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  portalSetupBtnText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '700',
   },
 });

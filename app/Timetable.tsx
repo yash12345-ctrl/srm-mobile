@@ -7,6 +7,7 @@ import {
   FlatList,
   Platform,
   Pressable,
+  RefreshControl,
   StatusBar,
   StyleSheet,
   Text,
@@ -27,12 +28,36 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import SRMAcademicReportScraper from '../components/SRMAcademicReportScraper';
-import SRMTimeTableScraper from '../components/SRMTimeTableScraper';
+
+import { fetchScrapedData } from '../utils/api';
+import {
+  isTimetableStale,
+  recordTimetableFetched,
+  isCalendarStale,
+  recordCalendarFetched,
+} from '../utils/cachePolicy';
+import { SkeletonBlock } from '../components/Skeleton';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { width } = Dimensions.get('window');
 
 // ─── Extracted Helper Methods ──────────────────────────────────────────
+
+const parseCalendarDate = (dStr: string) => {
+  if (!dStr || typeof dStr !== 'string') return new Date(NaN);
+  const clean = dStr.replace(/today/i, '').trim();
+  let m = clean.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  m = clean.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  const months = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+  m = clean.match(/^(\d{1,2})[-\s]([A-Za-z]{3,9})[-\s](\d{4})$/);
+  if (m) {
+    const idx = months.findIndex(x => m![2].toLowerCase().startsWith(x));
+    if (idx >= 0) return new Date(Number(m[3]), idx, Number(m[1]));
+  }
+  return new Date(clean);
+};
 
 function findCalendarMonthIndex(calendarData: any, date: Date): number {
   if (!calendarData?.monthNames) return -1;
@@ -49,11 +74,14 @@ function processHolidayNextDay(monthData: any[], startIndex: number, result: any
     if (wd === 6) result.event = "Saturday";
   }
   for (let i = startIndex + 1; i < monthData.length; i++) {
-    if (monthData[i].dayOrder && monthData[i].dayOrder !== "-") {
-      const nextNum = Number.parseInt(monthData[i].dayOrder.replaceAll(/\D/g, ""), 10);
-      if (!Number.isNaN(nextNum) && nextNum >= 1 && nextNum <= 5) {
-        result.nextDayOrder = nextNum;
-        break;
+    if (monthData[i]?.dayOrder && monthData[i].dayOrder !== "-") {
+      const nextMatch = String(monthData[i].dayOrder).match(/\d+/);
+      if (nextMatch) {
+        const nextNum = Number.parseInt(nextMatch[0], 10);
+        if (nextNum >= 1 && nextNum <= 5) {
+          result.nextDayOrder = nextNum;
+          break;
+        }
       }
     }
   }
@@ -61,10 +89,14 @@ function processHolidayNextDay(monthData: any[], startIndex: number, result: any
 
 function processCalendarDay(monthData: any[], todayItemIdx: number, result: any, today: Date) {
   const todayItem = monthData[todayItemIdx];
+  if (!todayItem) return;
   result.event = todayItem.event || null;
   if (todayItem.dayOrder && todayItem.dayOrder !== "-") {
-     const doNum = Number.parseInt(todayItem.dayOrder.replaceAll(/\D/g, ""), 10);
-     if (!Number.isNaN(doNum) && doNum >= 1 && doNum <= 5) result.index = doNum - 1;
+     const doMatch = String(todayItem.dayOrder).match(/\d+/);
+     if (doMatch) {
+       const doNum = Number.parseInt(doMatch[0], 10);
+       if (!Number.isNaN(doNum) && doNum >= 1 && doNum <= 5) result.index = doNum - 1;
+     }
   } else {
      processHolidayNextDay(monthData, todayItemIdx, result, today);
   }
@@ -73,15 +105,84 @@ function processCalendarDay(monthData: any[], todayItemIdx: number, result: any,
 function computeTodayContext(calendarData: any) {
   const result = { index: -1, event: null as string | null, isFreeDay: false, nextDayOrder: null as number | null };
   const today = new Date();
-  if (calendarData) {
-    const mIndex = findCalendarMonthIndex(calendarData, today);
-    if (mIndex !== -1 && calendarData.monthsData[mIndex]) {
-      const monthData = calendarData.monthsData[mIndex];
-      const todayDateStr = today.getDate().toString();
-      const todayItemIdx = monthData.findIndex((d: any) => d.date === todayDateStr);
-      if (todayItemIdx !== -1) processCalendarDay(monthData, todayItemIdx, result, today);
+
+  if (!calendarData) {
+    const wd = today.getDay();
+    if (wd === 0 || wd === 6) {
+      result.isFreeDay = true;
+      result.event = wd === 0 ? "Sunday" : "Saturday";
+    } else {
+      result.index = wd - 1;
+    }
+    return result;
+  }
+
+  const cal = calendarData.calendar || calendarData;
+
+  // ── SUPPORT BACKEND ROWS FORMAT ────────────────────────────────────
+  if (Array.isArray(cal.rows)) {
+    const todayIdx = cal.rows.findIndex((r: any) => {
+      if (!r?.date) return false;
+      const dt = parseCalendarDate(r.date);
+      return !isNaN(dt.getTime()) &&
+             dt.getFullYear() === today.getFullYear() &&
+             dt.getMonth() === today.getMonth() &&
+             dt.getDate() === today.getDate();
+    });
+
+    if (todayIdx !== -1) {
+      const todayRow = cal.rows[todayIdx];
+      result.event = (todayRow.remarks && todayRow.remarks !== '-')
+        ? todayRow.remarks
+        : (todayRow.status !== 'Working day' ? todayRow.status : null);
+
+      if (todayRow.dayOrder && todayRow.dayOrder !== '-') {
+        const numMatch = String(todayRow.dayOrder).match(/\d+/);
+        if (numMatch) {
+          const doNum = Number.parseInt(numMatch[0], 10);
+          if (doNum >= 1 && doNum <= 5) result.index = doNum - 1;
+        }
+      }
+
+      if (result.index === -1) {
+        result.isFreeDay = true;
+        if (!result.event) {
+          const wd = today.getDay();
+          result.event = wd === 0 ? "Sunday" : wd === 6 ? "Saturday" : (todayRow.status || "Holiday");
+        }
+        for (let i = todayIdx + 1; i < cal.rows.length; i++) {
+          const nextRow = cal.rows[i];
+          if (nextRow?.dayOrder && nextRow.dayOrder !== '-') {
+            const nextMatch = String(nextRow.dayOrder).match(/\d+/);
+            if (nextMatch) {
+              const nextNum = Number.parseInt(nextMatch[0], 10);
+              if (nextNum >= 1 && nextNum <= 5) {
+                result.nextDayOrder = nextNum;
+                break;
+              }
+            }
+          }
+        }
+      }
+      return result;
     }
   }
+
+  // ── SUPPORT LEGACY FORMAT: monthNames & monthsData ─────────────────
+  if (cal.monthNames && cal.monthsData) {
+    const mIndex = findCalendarMonthIndex(cal, today);
+    if (mIndex !== -1 && cal.monthsData[mIndex]) {
+      const monthData = cal.monthsData[mIndex];
+      const todayDateStr = today.getDate().toString();
+      const todayItemIdx = monthData.findIndex((d: any) => d.date === todayDateStr);
+      if (todayItemIdx !== -1) {
+        processCalendarDay(monthData, todayItemIdx, result, today);
+        return result;
+      }
+    }
+  }
+
+  // ── Fallback ───────────────────────────────────────────────────────
   if (result.index === -1 && !result.isFreeDay) {
     const wd = today.getDay();
     if (wd === 0 || wd === 6) {
@@ -494,12 +595,71 @@ export default function TimetableScreen() {
   
   // New States for Sync Indicator
   const [isSyncing, setIsSyncing] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [lastUpdatedLabel, setLastUpdatedLabel] = useState<string>("Checking...");
 
   useEffect(() => {
     const id = setInterval(() => forceUpdate(), 60_000);
     return () => clearInterval(id);
   }, []);
+
+  const fetchData = useCallback(async (force: boolean = false) => {
+    setIsSyncing(true);
+    try {
+      const tData = await fetchScrapedData('academia/login', { forceSync: force });
+      handleTimetableComplete(tData);
+      recordTimetableFetched();
+    } catch (err) {
+      console.error("Timetable fetch failed:", err);
+    }
+    try {
+      const portalPass = await AsyncStorage.getItem('portal_password');
+      if (portalPass) {
+        const cData = await fetchScrapedData('calendar/login', { forceSync: force });
+        setCalendarData(cData);
+        AsyncStorage.setItem('academic_calendar_data', JSON.stringify(cData)).catch(() => {});
+        recordCalendarFetched();
+      }
+    } catch (err: any) {
+      if (err?.message !== 'PORTAL_PASSWORD_REQUIRED') {
+        console.error("Calendar fetch failed:", err);
+      }
+    } finally {
+      setIsSyncing(false);
+      setRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // 1. Instant load from cache
+    Promise.all([
+      AsyncStorage.getItem('timetable_data'),
+      AsyncStorage.getItem('academic_calendar_data'),
+    ]).then(async ([cachedTimetable, cachedCalendar]) => {
+      const hasCached = !!cachedTimetable;
+      if (cachedTimetable) {
+        try { setTimetableData(JSON.parse(cachedTimetable)); } catch {}
+      }
+      if (cachedCalendar) {
+        try { setCalendarData(JSON.parse(cachedCalendar)); } catch {}
+      }
+
+      // Check once-per-day freshness policy (morning sync)
+      const timetableStale = await isTimetableStale();
+      const calendarStale = await isCalendarStale();
+
+      if (!hasCached || timetableStale || calendarStale) {
+        fetchData(false);
+      } else {
+        setIsSyncing(false);
+      }
+    });
+  }, [fetchData]);
+
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    fetchData(true);
+  }, [fetchData]);
 
   // ── NEW HOLIDAY & NEXT DAY AWARE LOGIC ─────────────────────────────
   const todayContext = useMemo(() => computeTodayContext(calendarData), [calendarData]);
@@ -527,7 +687,19 @@ export default function TimetableScreen() {
   }, [timetableData, calendarData, isDayInitialized, jumpToTodayOrder]);
 
   const handleTimetableComplete = (data: any) => {
-    setTimetableData(data);
+    if (!data) return;
+    let newTimetableData = data.timetable || data;
+    if (data.courses && (!newTimetableData.courses || newTimetableData === data)) {
+      const batchVal = data.profile?.batch ? parseInt(data.profile.batch.toString().replace(/\D/g, ''), 10) : 1;
+      newTimetableData = {
+        courses: data.courses || [],
+        batch: isNaN(batchVal) ? 1 : batchVal,
+        timetableGrid: data.timetableGrid
+      };
+    }
+    setTimetableData(newTimetableData);
+    AsyncStorage.setItem('timetable_data', JSON.stringify(newTimetableData)).catch(() => {});
+
     if (data.lastUpdated) {
         const ageInMs = Date.now() - new Date(data.lastUpdated).getTime();
         if (ageInMs < 5000) {
@@ -622,12 +794,18 @@ export default function TimetableScreen() {
       <Stack.Screen options={{ headerShown: false }} />
 
       <View style={{ position: 'absolute', opacity: 0, width: 1, height: 1 }}>
-        <SRMTimeTableScraper backgroundMode={true} onScrapeComplete={handleTimetableComplete} />
-        <SRMAcademicReportScraper backgroundMode={true} onScrapeComplete={setCalendarData} />
+        {/* Scrapers removed */}
       </View>
 
       {(!timetableData || !calendarData) ? (
-        <LoadingWave />
+        <View style={{ padding: 16, gap: 12, marginTop: 40 }}>
+            <SkeletonBlock style={{ height: 100, borderRadius: 20 }} />
+            <SkeletonBlock style={{ height: 70, borderRadius: 16, marginTop: 10 }} />
+            <SkeletonBlock style={{ height: 70, borderRadius: 16 }} />
+            <SkeletonBlock style={{ height: 70, borderRadius: 16 }} />
+            <SkeletonBlock style={{ height: 70, borderRadius: 16 }} />
+            <SkeletonBlock style={{ height: 70, borderRadius: 16 }} />
+        </View>
       ) : (
         /* ── ENTIRE SCREEN AS A SINGLE FLATLIST ──────────────────────────────── */
         <FlatList
@@ -635,6 +813,13 @@ export default function TimetableScreen() {
           keyExtractor={(item: any, i) => `${item.slot}-${i}`}
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              tintColor={T.primary}
+            />
+          }
           ListHeaderComponent={
             <View style={{ paddingBottom: 8 }}>
               {/* ── HEADER ── */}

@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
-import { Stack, useRouter } from 'expo-router';
+import { Stack, useRouter, useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
     ActivityIndicator,
@@ -40,8 +40,9 @@ import Svg, {
     Text as SvgText,
 } from 'react-native-svg';
 
-import SRMMarksScraper from '../components/SRMMarksScraper';
-
+import { fetchScrapedData } from '../utils/api';
+import { isMarksStale, recordMarksFetched } from '../utils/cachePolicy';
+import { SkeletonBlock } from '../components/Skeleton';
 const { width } = Dimensions.get('window');
 const AnimatedPath = Animated.createAnimatedComponent(Path);
 const AnimatedView = Animated.createAnimatedComponent(View);
@@ -155,15 +156,72 @@ const transformScraperData = (flatMarks: any[]) => {
     const grouped: Record<string, any> = {};
     flatMarks.forEach(mark => {
         if (mark?.code?.includes('Semester')) return;
-        const key = mark.code || mark.name;
+        const key = mark.code || mark.name || mark.description;
         if (!grouped[key]) {
-            grouped[key] = { code: mark.code, name: mark.name, components: [] };
+            grouped[key] = {
+                code: mark.code,
+                name: mark.name || mark.description,
+                description: mark.description || mark.name,
+                components: []
+            };
         }
-        const extractedScore = mark.scores ?? mark.score ?? mark.marks ?? mark.mark ?? mark.obtained ?? '';
+
+        // If mark already has component-wise breakdown from backend, preserve them
+        if (Array.isArray(mark.components) && mark.components.length > 0) {
+            mark.components.forEach((c: any) => {
+                const cScore = c.score || (c.maxMark || c.max ? `${c.markObtained ?? c.obtained} / ${c.maxMark ?? c.max}` : String(c.markObtained ?? c.obtained ?? ''));
+                grouped[key].components.push({
+                    test: c.test || c.name || c.type || 'Assessment',
+                    score: cScore,
+                    obtained: c.obtained ?? (c.markObtained ? Number(c.markObtained) : undefined),
+                    max: c.max ?? (c.maxMark ? Number(c.maxMark) : undefined),
+                    date: c.date,
+                });
+            });
+            return;
+        }
+
+        const extractedScore = mark.scores ?? mark.score ?? mark.marks ?? mark.mark ?? mark.obtained ?? mark.markObtained ?? '';
+        const extractedMax = mark.maxMark ?? mark.max_mark ?? mark.max ?? '';
         const extractedTest  = mark.type ?? mark.test ?? mark.assessment ?? mark.name ?? 'Assessment';
-        grouped[key].components.push({ test: extractedTest, score: extractedScore });
+        
+        let finalScoreStr = String(extractedScore);
+        if (extractedMax && finalScoreStr && !finalScoreStr.includes('/')) {
+            finalScoreStr = `${finalScoreStr} / ${extractedMax}`;
+        }
+        
+        grouped[key].components.push({ test: extractedTest, score: finalScoreStr });
     });
     return Object.values(grouped);
+};
+
+const processRawMarks = (rawMarks: any[], subjectMap: Record<string, string> = {}) => {
+    if (!Array.isArray(rawMarks) || rawMarks.length === 0) return [];
+
+    const grouped = transformScraperData(rawMarks);
+
+    return grouped.map((item: any) => {
+        const rawString = item.code || item.name || item.description || '';
+        const codeMatch = rawString.match(REGEX.COURSE_CODE);
+        const cleanCode = codeMatch ? codeMatch[0].toUpperCase() : normalizeCode(rawString);
+        const mappedName = subjectMap[cleanCode] || subjectMap[normalizeCode(rawString)];
+
+        let finalName = item.name || item.description;
+        if (!finalName || finalName === cleanCode || finalName.includes('Subject (Check') || finalName === 'Unknown Subject') {
+            finalName = mappedName || cleanCode || 'Unknown Subject';
+        } else if (mappedName && finalName.length < mappedName.length) {
+            finalName = mappedName;
+        }
+
+        finalName = finalName.replaceAll(REGEX.CLEAN_NAME, '').trim();
+
+        let finalCode = codeMatch ? codeMatch[0].toUpperCase() : (item.code || cleanCode);
+        if (finalName.startsWith(finalCode)) {
+            finalName = finalName.replace(finalCode, '').replace(/^[-\s]+/, '').trim();
+        }
+
+        return { ...item, name: finalName, code: finalCode };
+    }).filter((item: any) => !(item?.code?.includes('Semester')));
 };
 
 // ─── PARSING HELPERS ─────────────────────────────────────────────
@@ -180,21 +238,21 @@ const parseKnownFormat = (raw: string, baseName: string): AssessmentComponent | 
     let match = REGEX.NAMED_ABSENT.exec(raw);
     if (match) {
         const max = Number.parseFloat(match[2]) || 0;
-        return { name: match[1], scoreStr: `0 / ${max}`, obtained: 0, max, percent: 0 };
+        return { name: match[1], scoreStr: `0 / ${match[2]}`, obtained: 0, max, percent: 0 };
     }
 
     match = REGEX.NAMED_SCORE.exec(raw);
     if (match) {
         const max = Number.parseFloat(match[2]) || 0;
         const obtained = Number.parseFloat(match[3]) || 0;
-        return { name: match[1], scoreStr: `${obtained} / ${max}`, obtained, max, percent: max > 0 ? (obtained / max) * 100 : 0 };
+        return { name: match[1], scoreStr: `${match[3]} / ${match[2]}`, obtained, max, percent: max > 0 ? (obtained / max) * 100 : 0 };
     }
 
     match = REGEX.SCORE_FORMAT.exec(raw);
     if (match) {
         const obtained = Number.parseFloat(match[1]) || 0;
         const max = Number.parseFloat(match[2]) || 0;
-        return { name: baseName, scoreStr: `${obtained} / ${max}`, obtained, max, percent: max > 0 ? (obtained / max) * 100 : 0 };
+        return { name: baseName, scoreStr: `${match[1]} / ${match[2]}`, obtained, max, percent: max > 0 ? (obtained / max) * 100 : 0 };
     }
 
     match = REGEX.TRAILING_SCORE.exec(raw);
@@ -202,13 +260,13 @@ const parseKnownFormat = (raw: string, baseName: string): AssessmentComponent | 
         const max = Number.parseFloat(match[1]) || 0;
         const obtained = Number.parseFloat(match[2]) || 0;
         const label = raw.slice(0, raw.lastIndexOf('/')).trim() || baseName;
-        return { name: label, scoreStr: `${obtained} / ${max}`, obtained, max, percent: max > 0 ? (obtained / max) * 100 : 0 };
+        return { name: label, scoreStr: `${match[2]} / ${match[1]}`, obtained, max, percent: max > 0 ? (obtained / max) * 100 : 0 };
     }
 
     match = REGEX.SLASH_MAX.exec(raw);
     if (match) {
         const max = Number.parseFloat(match[2]) || 0;
-        return { name: match[1].trim() || baseName, scoreStr: `0 / ${max}`, obtained: 0, max, percent: 0 };
+        return { name: match[1].trim() || baseName, scoreStr: `0 / ${match[2]}`, obtained: 0, max, percent: 0 };
     }
 
     return null;
@@ -279,6 +337,9 @@ const processMarksData = (item: any) => {
         const existingMax = typeof comp.max === 'number' ? comp.max : Number(comp.max);
 
         let rawScore = String(comp.score ?? comp.scores ?? comp.scoreStr ?? comp.mark ?? comp.marks ?? '').trim();
+        if (!rawScore && comp.markObtained) {
+            rawScore = comp.maxMark ? `${comp.markObtained} / ${comp.maxMark}` : String(comp.markObtained);
+        }
         const rawTestName = String(comp.test || comp.name || comp.type || 'Assessment').trim();
 
         if (!rawScore && Number.isFinite(existingObtained)) {
@@ -662,6 +723,7 @@ export default function MarksScreen() {
     const [loading,     setLoading]     = useState(true);
     const [refreshing,  setRefreshing]  = useState(false);
     const [marksData,   setMarksData]   = useState<any[]>([]);
+    const [hasPortalPassword, setHasPortalPassword] = useState(true);
 
     const [isSyncing, setIsSyncing]     = useState(true);
     const [lastUpdatedLabel, setLastUpdatedLabel] = useState<string>("Checking...");
@@ -676,91 +738,210 @@ export default function MarksScreen() {
     }));
 
     const loadData = useCallback(async () => {
-        setLoading(true);
         try {
-            const stored = await AsyncStorage.getItem('academic_data');
-            if (stored) {
-                const parsed = JSON.parse(stored);
+            const [storedV2, storedAcademic, storedAcademia, portalPass] = await Promise.all([
+                AsyncStorage.getItem('internal_marks_data_v2'),
+                AsyncStorage.getItem('academic_data'),
+                AsyncStorage.getItem('academia_data'),
+                AsyncStorage.getItem('portal_password'),
+            ]);
 
-                const subjectMap = getSubjectMapping(parsed.attendance);
+            setHasPortalPassword(Boolean(portalPass));
 
-                if (parsed.marks?.length > 0) {
-                    let grouped = (!parsed.marks[0]?.components && !Array.isArray(parsed.marks[0]?.marks))
-                        ? transformScraperData(parsed.marks)
-                        : parsed.marks;
+            let subjectMap: Record<string, string> = {};
+            if (storedAcademic) {
+                try {
+                    const parsedAc = JSON.parse(storedAcademic);
+                    subjectMap = getSubjectMapping(parsedAc.attendance);
+                } catch {}
+            }
 
-                    grouped = grouped.map((item: any) => {
-                        const rawString = item.code || item.name || '';
-
-                        const codeMatch = rawString.match(REGEX.COURSE_CODE);
-                        const cleanCode = codeMatch ? codeMatch[0].toUpperCase() : normalizeCode(rawString);
-
-                        const mappedName = subjectMap[cleanCode] || subjectMap[normalizeCode(rawString)];
-
-                        let finalName = item.name;
-
-                        if (!finalName || finalName === cleanCode || finalName.includes('Subject (Check') || finalName === 'Unknown Subject') {
-                            finalName = mappedName || cleanCode || 'Unknown Subject';
-                        } else if (mappedName && finalName.length < mappedName.length) {
-                            finalName = mappedName;
+            // 1. Check dedicated internal_marks_data_v2 cache (fastest & reliable)
+            if (storedV2) {
+                try {
+                    const parsedV2 = JSON.parse(storedV2);
+                    const raw = parsedV2.data || parsedV2.marks;
+                    const processed = processRawMarks(raw, subjectMap);
+                    if (processed.length > 0) {
+                        if (parsedV2.lastUpdated) {
+                            setLastUpdatedLabel(formatTime(parsedV2.lastUpdated));
                         }
-
-                        finalName = finalName.replaceAll(REGEX.CLEAN_NAME, '').trim();
-
-                        let finalCode = codeMatch ? codeMatch[0].toUpperCase() : (item.code || cleanCode);
-                        if (finalName.startsWith(finalCode)) {
-                            finalName = finalName.replace(finalCode, '').replace(/^[-\s]+/, '').trim();
-                        }
-
-                        return { ...item, name: finalName, code: finalCode };
-                    });
-
-                    if (parsed.marks.lastUpdated) {
-                        grouped.lastUpdated = parsed.marks.lastUpdated;
-                        setLastUpdatedLabel(formatTime(parsed.marks.lastUpdated));
+                        setMarksData(processed);
+                        setLoading(false);
+                        setIsSyncing(false);
+                        return true;
                     }
-
-                    setMarksData(grouped);
-                    setLoading(false); setRefreshing(false);
-                    return;
+                } catch (e) {
+                    console.error('Error parsing internal_marks_data_v2:', e);
                 }
             }
-            setLoading(false); setRefreshing(false);
+
+            // 2. Check academic_data
+            if (storedAcademic) {
+                try {
+                    const parsed = JSON.parse(storedAcademic);
+                    if (Array.isArray(parsed.marks) && parsed.marks.length > 0) {
+                        const processed = processRawMarks(parsed.marks, subjectMap);
+                        if (processed.length > 0) {
+                            if (parsed.marks.lastUpdated) {
+                                setLastUpdatedLabel(formatTime(parsed.marks.lastUpdated));
+                            }
+                            setMarksData(processed);
+                            setLoading(false);
+                            setIsSyncing(false);
+                            return true;
+                        }
+                    }
+                } catch {}
+            }
+
+            // 3. Fallback: check academia_data
+            if (storedAcademia) {
+                try {
+                    const parsedAcademia = JSON.parse(storedAcademia);
+                    const im = parsedAcademia.internalMarks || parsedAcademia.marks;
+                    if (Array.isArray(im) && im.length > 0) {
+                        const processed = processRawMarks(im, subjectMap);
+                        if (processed.length > 0) {
+                            setMarksData(processed);
+                            setLoading(false);
+                            setIsSyncing(false);
+                            return true;
+                        }
+                    }
+                } catch {}
+            }
+
+            return false;
         } catch (e) {
-            console.error(e);
-            setLoading(false); setRefreshing(false);
+            console.error('Error in loadData:', e);
+            return false;
+        } finally {
+            setRefreshing(false);
         }
     }, []);
 
-    useEffect(() => { loadData(); }, [loadData]);
+    useEffect(() => {
+        let isMounted = true;
+        loadData().then((hasCache) => {
+            if (!isMounted) return;
+            AsyncStorage.getItem('portal_password').then(async (portalPass) => {
+                if (!isMounted) return;
+                if (portalPass) {
+                    const isStale = await isMarksStale();
+                    if (!hasCache) {
+                        setLoading(true);
+                        fetchMarks(false);
+                    } else if (isStale) {
+                        // Background revalidation (> 2 hours)
+                        fetchMarks(false);
+                    } else {
+                        setLoading(false);
+                        setIsSyncing(false);
+                    }
+                } else {
+                    setLoading(false);
+                    setIsSyncing(false);
+                }
+            });
+        });
+        return () => { isMounted = false; };
+    }, [loadData]);
 
     const onRefresh = () => {
         setRefreshing(true);
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        setTimeout(loadData, 1000);
+        fetchMarks(true);
     };
+
+    const fetchMarks = async (force: boolean = false) => {
+        try {
+            const portalPass = await AsyncStorage.getItem('portal_password');
+            if (!portalPass) {
+                setHasPortalPassword(false);
+                setIsSyncing(false);
+                setRefreshing(false);
+                setLoading(false);
+                return;
+            }
+            setHasPortalPassword(true);
+            setIsSyncing(true);
+            const data = await fetchScrapedData('internal-marks/login', { forceSync: force });
+            await handleScrapeComplete(data);
+            recordMarksFetched();
+        } catch (e: any) {
+            if (e.message !== 'PORTAL_PASSWORD_REQUIRED') {
+                console.error(e);
+            }
+            setIsSyncing(false);
+            setRefreshing(false);
+            setLoading(false);
+        }
+    };
+
+    useFocusEffect(
+        useCallback(() => {
+            AsyncStorage.getItem('portal_password').then(portalPass => {
+                setHasPortalPassword(Boolean(portalPass));
+            });
+        }, [])
+    );
 
     const handleScrapeComplete = async (newData: any) => {
         try {
-            const stored = await AsyncStorage.getItem('academic_data');
-            let parsed = stored ? JSON.parse(stored) : {};
-            parsed.marks = newData;
-            await AsyncStorage.setItem('academic_data', JSON.stringify(parsed));
-
-            loadData();
-
-            if (newData.lastUpdated) {
-                const ageInMs = Date.now() - new Date(newData.lastUpdated).getTime();
-                if (ageInMs < 5000) {
-                    setLastUpdatedLabel("Just now");
-                    setIsSyncing(false);
-                } else {
-                    setLastUpdatedLabel(formatTime(newData.lastUpdated));
-                    setIsSyncing(true);
-                }
+            if (!newData || newData.success === false) {
+                setIsSyncing(false);
+                setRefreshing(false);
+                setLoading(false);
+                return;
             }
+
+            const actualMarks = Array.isArray(newData) ? newData : (newData.marks || []);
+            if (!Array.isArray(actualMarks) || actualMarks.length === 0) {
+                setIsSyncing(false);
+                setRefreshing(false);
+                setLoading(false);
+                return;
+            }
+
+            const lastUpdated = newData.lastUpdated || new Date().toISOString();
+
+            // 1. Save to dedicated v2 storage
+            const cacheObj = {
+                data: actualMarks,
+                lastUpdated
+            };
+            await AsyncStorage.setItem('internal_marks_data_v2', JSON.stringify(cacheObj));
+
+            // 2. Also keep academic_data updated
+            try {
+                const stored = await AsyncStorage.getItem('academic_data');
+                let parsed = stored ? JSON.parse(stored) : {};
+                parsed.marks = actualMarks;
+                await AsyncStorage.setItem('academic_data', JSON.stringify(parsed));
+            } catch {}
+
+            // 3. Immediately process and display
+            let subjectMap: Record<string, string> = {};
+            try {
+                const storedAc = await AsyncStorage.getItem('academic_data');
+                if (storedAc) subjectMap = getSubjectMapping(JSON.parse(storedAc).attendance);
+            } catch {}
+
+            const processed = processRawMarks(actualMarks, subjectMap);
+            if (processed.length > 0) {
+                setMarksData(processed);
+            }
+
+            setLastUpdatedLabel(formatTime(lastUpdated));
+            setIsSyncing(false);
+            setRefreshing(false);
+            setLoading(false);
         } catch (e) {
-            console.error(e);
+            console.error('Error handling scrape complete for marks:', e);
+            setIsSyncing(false);
+            setRefreshing(false);
+            setLoading(false);
         }
     };
 
@@ -772,10 +953,7 @@ export default function MarksScreen() {
             <StatusBar barStyle="dark-content" backgroundColor={T.navBg} />
 
             <View style={{ position: 'absolute', opacity: 0, width: 1, height: 1 }}>
-                <SRMMarksScraper
-                    backgroundMode={true}
-                    onScrapeComplete={handleScrapeComplete}
-                />
+                {/* Scraper moved to backend */}
             </View>
 
             {/* ── NAV BAR ── */}
@@ -828,11 +1006,13 @@ export default function MarksScreen() {
                 showsVerticalScrollIndicator={false}
             >
                 {loading && displayData.length === 0 && (
-                    <WaveLoader
-                        title="Syncing marks"
-                        subtitle="Fetching your latest assessment scores from Academia."
-                        color={T.accent}
-                    />
+                    <View style={{ padding: 16, gap: 16 }}>
+                        <SkeletonBlock style={{ height: 140, borderRadius: 20 }} />
+                        <SkeletonBlock style={{ height: 140, borderRadius: 20 }} />
+                        <SkeletonBlock style={{ height: 140, borderRadius: 20 }} />
+                        <SkeletonBlock style={{ height: 140, borderRadius: 20 }} />
+                        <SkeletonBlock style={{ height: 140, borderRadius: 20 }} />
+                    </View>
                 )}
 
                 {!loading && displayData.length > 0 && <SummaryStrip data={displayData} />}
@@ -840,13 +1020,34 @@ export default function MarksScreen() {
                 {!loading && displayData.map((item, i) => <MarkCard key={`${item.code || item.name}-${i}`} item={item} index={i} />)}
 
                 {displayData.length === 0 && !loading && (
-                    <Animated.View entering={FadeInDown.delay(100).springify()} style={styles.empty}>
-                        <View style={styles.emptyIcon}>
-                            <Ionicons name="analytics-outline" size={36} color={T.accent} />
-                        </View>
-                        <Text style={styles.emptyTitle}>No Marks Yet</Text>
-                        <Text style={styles.emptySub}>Pull down to refresh and fetch your latest assessment scores from the portal.</Text>
-                    </Animated.View>
+                    !hasPortalPassword ? (
+                        <Animated.View entering={FadeInDown.delay(100).springify()} style={styles.portalSetupCard}>
+                            <View style={styles.portalSetupIconWrap}>
+                                <Ionicons name="key-outline" size={32} color={T.accent} />
+                            </View>
+                            <Text style={styles.portalSetupTitle}>Student Portal Setup Required</Text>
+                            <Text style={styles.portalSetupSub}>
+                                To view your internal marks and assessment scores, please go to Attendance and enter your Student Portal credentials once.
+                            </Text>
+                            <TouchableOpacity
+                                style={styles.portalSetupBtn}
+                                onPress={() => router.push('/attendance')}
+                                activeOpacity={0.8}
+                            >
+                                <Ionicons name="clipboard-outline" size={18} color="#FFFFFF" />
+                                <Text style={styles.portalSetupBtnText}>Go to Attendance</Text>
+                                <Ionicons name="arrow-forward" size={16} color="#FFFFFF" />
+                            </TouchableOpacity>
+                        </Animated.View>
+                    ) : (
+                        <Animated.View entering={FadeInDown.delay(100).springify()} style={styles.empty}>
+                            <View style={styles.emptyIcon}>
+                                <Ionicons name="analytics-outline" size={36} color={T.accent} />
+                            </View>
+                            <Text style={styles.emptyTitle}>No Marks Yet</Text>
+                            <Text style={styles.emptySub}>Pull down to refresh and fetch your latest assessment scores from the portal.</Text>
+                        </Animated.View>
+                    )
                 )}
 
                 <View style={{ height: 40 }} />
@@ -1054,5 +1255,71 @@ const styles = StyleSheet.create({
         fontSize: 13, color: T.textLight,
         textAlign: 'center', paddingHorizontal: 40,
         lineHeight: 20,
+    },
+
+    // ── Portal Setup Card ──────────────────────────────────────────
+    portalSetupCard: {
+        marginHorizontal: 4,
+        marginTop: 20,
+        backgroundColor: T.cardBg,
+        borderRadius: 24,
+        padding: 24,
+        alignItems: 'center',
+        borderWidth: 1,
+        borderColor: T.borderLight,
+        shadowColor: T.shadow,
+        shadowOffset: { width: 0, height: 6 },
+        shadowOpacity: 0.08,
+        shadowRadius: 16,
+        elevation: 3,
+    },
+    portalSetupIconWrap: {
+        width: 64,
+        height: 64,
+        borderRadius: 20,
+        backgroundColor: T.accentLight,
+        alignItems: 'center',
+        justifyContent: 'center',
+        marginBottom: 16,
+        borderWidth: 1,
+        borderColor: T.accent + '25',
+    },
+    portalSetupTitle: {
+        fontSize: 19,
+        fontWeight: '800',
+        color: T.text,
+        fontFamily: FONT.display,
+        letterSpacing: -0.4,
+        textAlign: 'center',
+        marginBottom: 8,
+    },
+    portalSetupSub: {
+        fontSize: 14,
+        color: T.textSub,
+        textAlign: 'center',
+        lineHeight: 21,
+        marginBottom: 20,
+        paddingHorizontal: 8,
+    },
+    portalSetupBtn: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+        backgroundColor: T.accent,
+        paddingVertical: 14,
+        paddingHorizontal: 24,
+        borderRadius: 16,
+        width: '100%',
+        shadowColor: T.accent,
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.25,
+        shadowRadius: 8,
+        elevation: 3,
+    },
+    portalSetupBtnText: {
+        color: '#FFFFFF',
+        fontSize: 15,
+        fontWeight: '700',
     },
 });

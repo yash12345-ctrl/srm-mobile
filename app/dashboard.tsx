@@ -3,7 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 import { Image } from 'expo-image';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Stack, useRouter } from 'expo-router';
+import { Stack, useRouter, useFocusEffect } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Dimensions,
@@ -24,6 +24,7 @@ import Animated, {
   FadeInRight,
   FadeOut,
   interpolate,
+  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
@@ -35,12 +36,19 @@ import Animated, {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 // 1. IMPORT YOUR COMPONENTS & SCRAPERS
+import { fetchScrapedData } from "../utils/api";
+import {
+  isAttendanceStale,
+  recordAttendanceFetched,
+  isMarksStale,
+  recordMarksFetched,
+  isTimetableStale,
+  recordTimetableFetched,
+  isCalendarStale,
+  recordCalendarFetched,
+  CACHE_KEYS,
+} from '../utils/cachePolicy';
 import FingerprintMenu from '../components/SideMenu';
-import SRMAcademicReportScraper from '../components/SRMAcademicReportScraper';
-import SRMAttendanceScraper from '../components/SRMAttendanceScraper';
-import SRMMarksScraper from '../components/SRMMarksScraper';
-import SRMProfileScraper from '../components/SRMProfileScraper';
-import SRMTimeTableScraper from '../components/SRMTimeTableScraper';
 
 // 2. UPDATE CHECK
 import { useUpdateCheck } from '../hooks/useUpdateCheck';
@@ -256,15 +264,20 @@ const CriticalAttendanceCarousel = ({ items }: { items: any[] }) => {
   const flip = useSharedValue(0);
   const CARD_W = width - 48;
 
+  const updateIndex = (idx: number) => {
+    setCurrentIndex(idx);
+  };
+
   const go = (dir: 1 | -1) => {
     const next = currentIndex + dir;
     if (next < 0 || next >= items.length) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    flip.value = withTiming(dir * -90, { duration: 180 }, () => {
-      const updateIndex = (idx: number) => { setCurrentIndex(idx); };
-      updateIndex(next); // NOSONAR
-      flip.value = dir * 90;
-      flip.value = withTiming(0, { duration: 180 });
+    flip.value = withTiming(dir * -90, { duration: 180 }, (finished) => {
+      if (finished) {
+        runOnJS(updateIndex)(next);
+        flip.value = dir * 90;
+        flip.value = withTiming(0, { duration: 180 });
+      }
     });
   };
 
@@ -278,8 +291,9 @@ const CriticalAttendanceCarousel = ({ items }: { items: any[] }) => {
     opacity: interpolate(flip.value, [-90, 0, 90], [0.4, 1, 0.4], Extrapolation.CLAMP),
   }));
 
-  const item = items[currentIndex];
-  const val  = Number.parseFloat(item.attendance);
+  const item = items[currentIndex] || items[0];
+  if (!item) return null;
+  const val  = Number.parseFloat(item.percentage || item.attendance) || 0;
   const pct  = Math.min(val, 100);
   const gap  = 75 - val;
   const punchline = ATTENDANCE_PUNCHLINES[currentIndex % ATTENDANCE_PUNCHLINES.length];
@@ -296,7 +310,7 @@ const CriticalAttendanceCarousel = ({ items }: { items: any[] }) => {
               <Ionicons name="warning" size={10} color={COLORS.danger} />
               <Text style={styles.critBadgeText}>ACTION REQUIRED</Text>
             </View>
-            <Text style={styles.critSubjectName} numberOfLines={2}>{item.subject}</Text>
+            <Text style={styles.critSubjectName} numberOfLines={2}>{item.title || item.subject}</Text>
           </View>
           <View style={styles.critCircle}>
             <View style={styles.critCircleValueRow}>
@@ -364,11 +378,12 @@ function getCourseForSlot(courses: any[], slot: string) {
 
 export default function DashboardScreen() {
   const router = useRouter();
+  const [hasPortalPassword, setHasPortalPassword] = useState(true);
   const [loading, setLoading]         = useState(true);
   const [data, setData]               = useState<{ attendance: any[], marks: any[] } | null>(null);
   const [timetable, setTimetable]     = useState<any>(null);
   const [calendar, setCalendar]       = useState<any>(null);
-  const [profileData, setProfileData] = useState<{ name: string, registerNumber: string, imageUrl: string } | null>(null);
+  const [profileData, setProfileData] = useState<{ name: string, registerNumber?: string, registrationNumber?: string, imageUrl?: string } | null>(null);
   const [netId, setNetId]             = useState('User');
   const [refreshing, setRefreshing]   = useState(false);
   const [tick, setTick]               = useState(0);
@@ -400,24 +415,95 @@ export default function DashboardScreen() {
     });
     const timer = setInterval(() => setTick(t => t + 1), 60000);
     return () => clearInterval(timer);
-  }, []);
-
-  const currentAppVersion = CURRENT_VERSION;
+  }, []);  const currentAppVersion = CURRENT_VERSION;
 
   const loadSession = useCallback(async () => {
     try {
-      const [storedId, storedData, storedTimetable, storedCalendar, storedProfile] = await Promise.all([
+      const [
+        storedId,
+        storedAcademic,
+        storedTimetable,
+        storedCalendar,
+        storedProfile,
+        storedPortalPass,
+        storedAttV2,
+        storedAttV1,
+      ] = await Promise.all([
         AsyncStorage.getItem('user_netid'),
         AsyncStorage.getItem('academic_data'),
         AsyncStorage.getItem('timetable_data'),
         AsyncStorage.getItem('academic_calendar_data'),
         AsyncStorage.getItem('student_profile_data'),
+        AsyncStorage.getItem('portal_password'),
+        AsyncStorage.getItem('attendance_data_v2'),
+        AsyncStorage.getItem('attendance_data'),
       ]);
+
+      const hasPass = Boolean(storedPortalPass);
+      setHasPortalPassword(hasPass);
+
       if (storedId)        setNetId(storedId);
       if (storedTimetable) setTimetable(JSON.parse(storedTimetable));
       if (storedCalendar)  setCalendar(JSON.parse(storedCalendar));
-      if (storedData)      setData(JSON.parse(storedData));
-      if (storedProfile)   setProfileData(JSON.parse(storedProfile));
+
+      // Resolve attendance & marks from all caches
+      let finalAttendance: any[] = [];
+      let finalMarks: any[] = [];
+
+      if (storedAcademic) {
+        try {
+          const parsed = JSON.parse(storedAcademic);
+          if (Array.isArray(parsed.attendance)) finalAttendance = parsed.attendance;
+          if (Array.isArray(parsed.marks)) finalMarks = parsed.marks;
+        } catch {}
+      }
+
+      // If academic_data didn't have attendance, pull from attendance_data_v2 or v1
+      if (finalAttendance.length === 0 && storedAttV2) {
+        try {
+          const parsedV2 = JSON.parse(storedAttV2);
+          const att = parsedV2.data || parsedV2.attendance;
+          if (Array.isArray(att)) finalAttendance = att;
+        } catch {}
+      }
+      if (finalAttendance.length === 0 && storedAttV1) {
+        try {
+          const parsedV1 = JSON.parse(storedAttV1);
+          const att = parsedV1.data || parsedV1.attendance;
+          if (Array.isArray(att)) finalAttendance = att;
+        } catch {}
+      }
+
+      // If academic_data didn't have marks, pull from internal_marks_data_v2
+      if (finalMarks.length === 0) {
+        try {
+          const storedMarksV2 = await AsyncStorage.getItem('internal_marks_data_v2');
+          if (storedMarksV2) {
+            const parsedV2 = JSON.parse(storedMarksV2);
+            const m = parsedV2.data || parsedV2.marks;
+            if (Array.isArray(m)) finalMarks = m;
+          }
+        } catch {}
+      }
+
+      setData({
+        attendance: finalAttendance,
+        marks: finalMarks,
+      });
+
+      if (storedProfile) {
+        try {
+          const parsed = JSON.parse(storedProfile);
+          const prof = parsed.profile || parsed;
+          const reg = prof.registrationNumber || prof.registerNumber || '';
+          setProfileData({
+            ...prof,
+            name: prof.name || '',
+            registerNumber: reg,
+            registrationNumber: reg,
+          });
+        } catch {}
+      }
     } catch (e) {
       console.error(e);
     } finally {
@@ -426,11 +512,149 @@ export default function DashboardScreen() {
     }
   }, []);
 
-  const onRefresh = useCallback(() => {
-    setRefreshing(true);
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setTimeout(loadSession, 1000);
+  useFocusEffect(
+    useCallback(() => {
+      loadSession();
+    }, [loadSession])
+  );
+
+  const onRefresh = useCallback(async (isManual: boolean = true) => {
+    if (isManual) {
+      setRefreshing(true);
+      try { Haptics.ImpactFeedbackStyle && Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); } catch {}
+    }
+    try {
+      const portalPass = await AsyncStorage.getItem('portal_password');
+
+      const shouldFetchTimetable = isManual || (await isTimetableStale());
+      const shouldFetchAttendance = isManual || (await isAttendanceStale());
+      const shouldFetchMarks = isManual || (await isMarksStale());
+      const shouldFetchCalendar = isManual || (await isCalendarStale());
+
+      const requests: { key: string; promise: Promise<any> }[] = [];
+
+      if (shouldFetchTimetable) {
+        requests.push({
+          key: 'academia',
+          promise: fetchScrapedData('academia/login', { forceSync: isManual })
+        });
+      }
+
+      if (portalPass) {
+        if (shouldFetchAttendance) {
+          requests.push({
+            key: 'attendance',
+            promise: fetchScrapedData('attendance/login', { forceSync: isManual })
+          });
+        }
+        if (shouldFetchMarks) {
+          requests.push({
+            key: 'grades',
+            promise: fetchScrapedData('grades/login', { forceSync: isManual })
+          });
+        }
+        if (shouldFetchCalendar) {
+          requests.push({
+            key: 'calendar',
+            promise: fetchScrapedData('calendar/login', { forceSync: isManual })
+          });
+        }
+      }
+
+      if (requests.length === 0) {
+        return;
+      }
+
+      const results = await Promise.allSettled(requests.map(r => r.promise));
+      
+      const getResult = (key: string) => {
+        const idx = requests.findIndex(r => r.key === key);
+        return idx !== -1 ? results[idx] : null;
+      };
+
+      const academia = getResult('academia');
+      const attendanceRes = getResult('attendance');
+      const marksRes = getResult('grades');
+      const calendarRes = getResult('calendar');
+      
+      let newAttendance: any = null;
+
+      if (attendanceRes && attendanceRes.status === 'fulfilled' && attendanceRes.value) {
+         const val = attendanceRes.value;
+         if (Array.isArray(val)) {
+            newAttendance = val;
+         } else if (Array.isArray(val.attendance)) {
+            newAttendance = val.attendance;
+         } else if (Array.isArray(val.data)) {
+            newAttendance = val.data;
+         }
+         recordAttendanceFetched();
+      }
+      if (marksRes && marksRes.status === 'fulfilled' && marksRes.value) {
+         const resVal = marksRes.value;
+         if (resVal.semesters || resVal.cgpa || resVal.grades) {
+            await AsyncStorage.setItem('grades_data', JSON.stringify(resVal));
+         }
+         recordMarksFetched();
+      }
+      if (newAttendance) {
+         await AsyncStorage.setItem('attendance_data_v2', JSON.stringify({
+            data: newAttendance,
+            lastUpdated: new Date().toISOString()
+         })).catch(() => {});
+
+         const oldStr = await AsyncStorage.getItem('academic_data');
+         const old = oldStr ? JSON.parse(oldStr) : {};
+         const finalData = { 
+            attendance: newAttendance, 
+            marks: old.marks || [] 
+         };
+         await AsyncStorage.setItem('academic_data', JSON.stringify(finalData));
+         setData(finalData);
+      }
+      
+      if (calendarRes && calendarRes.status === 'fulfilled' && calendarRes.value) {
+         await AsyncStorage.setItem('academic_calendar_data', JSON.stringify(calendarRes.value));
+         recordCalendarFetched();
+      }
+      
+      if (academia && academia.status === 'fulfilled' && academia.value) {
+         const result = academia.value;
+         const batchVal = result.profile?.batch ? parseInt(result.profile.batch.toString().replace(/\D/g, ''), 10) : 1;
+         const newTimetable = {
+           courses: result.courses || [],
+           batch: isNaN(batchVal) ? 1 : batchVal,
+           timetableGrid: result.timetableGrid
+         };
+         await AsyncStorage.setItem('timetable_data', JSON.stringify(newTimetable));
+         recordTimetableFetched();
+         if (result.profile) {
+           const reg = result.profile.registrationNumber || result.profile.registerNumber || '';
+           const prof = {
+             ...result.profile,
+             registerNumber: reg,
+             registrationNumber: reg,
+           };
+           await AsyncStorage.setItem('student_profile_data', JSON.stringify(prof));
+           setProfileData(prof);
+         }
+      }
+    } catch (e) {
+      console.error('[Dashboard onRefresh]', e);
+    } finally {
+      await loadSession();
+    }
   }, [loadSession]);
+
+  const hasAutoRefreshed = useRef(false);
+
+  useEffect(() => {
+    if (dashboardReady && !hasAutoRefreshed.current) {
+      hasAutoRefreshed.current = true;
+      // Always fetch fresh data silently on mount from backend (Redis -> DB -> Scraper pipeline)
+      onRefresh(false);
+    }
+  }, [dashboardReady, onRefresh]);
 
   const mergeAcademicData = useCallback((partial: { attendance?: any[]; marks?: any[] }) => {
     setData(prev => {
@@ -460,7 +684,15 @@ export default function DashboardScreen() {
   }, [mergeAcademicData]);
 
   const handleProfileScrapeComplete = useCallback((scrapedProfile: any) => {
-    setProfileData(scrapedProfile);
+    if (!scrapedProfile) return;
+    const prof = scrapedProfile.profile || scrapedProfile;
+    const reg = prof.registrationNumber || prof.registerNumber || '';
+    setProfileData({
+      ...prof,
+      name: prof.name || '',
+      registerNumber: reg,
+      registrationNumber: reg,
+    });
   }, []);
 
   const currentDateTime = useMemo(() => new Date(), [tick]);
@@ -474,17 +706,86 @@ export default function DashboardScreen() {
   }, [currentDateTime]);
 
   const avgAtt = useMemo(() => {
-    if (!data?.attendance.length) return '—';
-    const total = data.attendance.reduce((s, i) => s + (Number.parseFloat(i.attendance) || 0), 0);
-    return (total / data.attendance.length).toFixed(1);
+    if (!data?.attendance || !Array.isArray(data.attendance) || data.attendance.length === 0) return '—';
+
+    // Filter started subjects (subjects where hours have been conducted)
+    const started = data.attendance.filter((item: any) => {
+      const maxH = Number.parseInt(item.maxHours || item.totalHours || item.hoursConduct || '0', 10);
+      return !isNaN(maxH) && maxH > 0;
+    });
+
+    const subjectsToCalc = started.length > 0 ? started : data.attendance;
+
+    let validCount = 0;
+    const total = subjectsToCalc.reduce((sum: number, item: any) => {
+      const raw = item.percentage ?? item.attendance ?? item.percent;
+      const parsed = Number.parseFloat(String(raw || '').replace(/%/g, '').trim());
+      if (!isNaN(parsed)) {
+        validCount++;
+        return sum + parsed;
+      }
+      return sum;
+    }, 0);
+
+    if (validCount === 0) return '—';
+    return (total / validCount).toFixed(1);
   }, [data]);
 
   const criticalAttendance = useMemo(() =>
-    data?.attendance.filter(i => Number.parseFloat(i.attendance) < 75) ?? [], [data]);
+    data?.attendance?.filter((i: any) => {
+      const total = Number.parseInt(i.maxHours || i.totalHours || i.hoursConduct || '0', 10) || 0;
+      if (total === 0) return false;
+      const raw = i.percentage ?? i.attendance ?? i.percent;
+      const pct = Number.parseFloat(String(raw || '').replace(/%/g, '').trim()) || 0;
+      return pct < 75;
+    }) ?? [], [data]);
 
   const todayInfo = useMemo(() => {
     if (!calendar) return { dayOrderNum: null, eventName: null };
     const today = new Date();
+    
+    // --- NEW BACKEND FORMAT ---
+    if (calendar.rows) {
+      const months = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+      const parseDate = (dStr: string) => {
+        const clean = dStr.replace(/today/i, '').trim();
+        let m = clean.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+        if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+        m = clean.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+        if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+        m = clean.match(/^(\d{1,2})[-\s]([A-Za-z]{3,9})[-\s](\d{4})$/);
+        if (m) {
+          const idx = months.findIndex(x => m![2].toLowerCase().startsWith(x));
+          if (idx >= 0) return new Date(Number(m[3]), idx, Number(m[1]));
+        }
+        return new Date(clean);
+      };
+      
+      const found = calendar.rows.find((r: any) => {
+        if (!r.date) return false;
+        const dt = parseDate(r.date);
+        return !isNaN(dt.getTime()) && 
+               dt.getFullYear() === today.getFullYear() && 
+               dt.getMonth() === today.getMonth() && 
+               dt.getDate() === today.getDate();
+      });
+      
+      if (!found) return { dayOrderNum: null, eventName: null };
+      let dayOrderNum: number | null = null;
+      if (found.dayOrder && found.dayOrder !== '-') {
+        const numMatch = String(found.dayOrder).match(/\d+/);
+        if (numMatch) {
+          dayOrderNum = Number.parseInt(numMatch[0], 10);
+        }
+      }
+      
+      const eventName = (found.remarks && found.remarks !== '-') ? found.remarks : (found.status || null);
+      return { dayOrderNum, eventName };
+    }
+
+    // --- OLD FORMAT ---
+    if (!calendar.monthNames || !calendar.monthsData) return { dayOrderNum: null, eventName: null };
+    
     const todayDateStr       = today.getDate().toString();
     const currentMonthShort  = today.toLocaleString('en-US', { month: 'short' });
     const currentMonthLong   = today.toLocaleString('en-US', { month: 'long' });
@@ -494,10 +795,15 @@ export default function DashboardScreen() {
     if (mIndex === -1) return { dayOrderNum: null, eventName: null };
     const dayData = calendar.monthsData[mIndex]?.find((d: any) => d.date === todayDateStr);
     if (!dayData) return { dayOrderNum: null, eventName: null };
-    const dayOrderNum = dayData.dayOrder?.includes('DO -')
-      ? Number.parseInt(dayData.dayOrder.replace('DO - ', '').trim(), 10)
-      : null;
-    return { dayOrderNum, eventName: dayData.event };
+    let dayOrderNum: number | null = null;
+    if (dayData.dayOrder && dayData.dayOrder !== '-') {
+      const numMatch = String(dayData.dayOrder).match(/\d+/);
+      if (numMatch) {
+        dayOrderNum = Number.parseInt(numMatch[0], 10);
+      }
+    }
+    const eventName = (dayData.event && dayData.event !== '-') ? dayData.event : (dayData.remarks || null);
+    return { dayOrderNum, eventName };
   }, [calendar]);
 
   const displayDayOrder = todayInfo.dayOrderNum;
@@ -581,6 +887,7 @@ export default function DashboardScreen() {
     // ✅ Bug 1 Fix: reset the guard so session-expiry modal can fire again
     // if the user logs back in within the same app lifecycle
     hasHandledSessionExpired.current = false;
+    hasAutoRefreshed.current = false;
     AsyncStorage.clear().then(() => router.replace('/'));
   }, [router]);
 
@@ -598,6 +905,16 @@ export default function DashboardScreen() {
     'academic_calendar_data',
     'student_profile_data',
     'attendance_data_v2',
+    'attendance_data',
+    'internal_marks_data_v2',
+    'portal_password',
+    'grades_data',
+    'session_active',
+    'session_token',
+    CACHE_KEYS.ATTENDANCE_TS,
+    CACHE_KEYS.MARKS_TS,
+    CACHE_KEYS.TIMETABLE_TS,
+    CACHE_KEYS.CALENDAR_TS,
   ] as const;
 
   const handleSessionExpired = useCallback(() => {
@@ -634,7 +951,17 @@ export default function DashboardScreen() {
 
   // ── Render helpers (extracted to avoid nested ternaries in JSX) ────────────
   const renderPerformanceStats = () => {
-    if (!data) {
+    if (!hasPortalPassword && (!data?.attendance || data.attendance.length === 0)) {
+      return (
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 }}>
+          <Ionicons name="key-outline" size={15} color="rgba(255,255,255,0.85)" />
+          <Text style={{ fontSize: 13, color: 'rgba(255,255,255,0.9)', fontWeight: '600' }}>
+            Setup required in Attendance →
+          </Text>
+        </View>
+      );
+    }
+    if (loading && (!data?.attendance || data.attendance.length === 0)) {
       return <SkeletonBlock style={{ width: 110, height: 52, borderRadius: 8, marginTop: 4 }} />;
     }
     return (
@@ -677,7 +1004,35 @@ export default function DashboardScreen() {
   };
 
   const renderCriticalAttendance = () => {
-    if (!data) {
+    if (!hasPortalPassword && (!data?.attendance || data.attendance.length === 0)) {
+      return (
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onPress={() => router.push('/attendance')}
+          style={{
+            marginHorizontal: 24,
+            padding: 16,
+            borderRadius: 18,
+            backgroundColor: COLORS.surface,
+            borderWidth: 1,
+            borderColor: COLORS.border,
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 12,
+          }}
+        >
+          <View style={{ width: 40, height: 40, borderRadius: 12, backgroundColor: COLORS.brandTint, alignItems: 'center', justifyContent: 'center' }}>
+            <Ionicons name="key-outline" size={20} color={COLORS.brandMid} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.textPrimary }}>Setup Student Portal</Text>
+            <Text style={{ fontSize: 12, color: COLORS.textSecondary, marginTop: 2 }}>Tap to enter portal password in Attendance</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={COLORS.textTertiary} />
+        </TouchableOpacity>
+      );
+    }
+    if (loading && (!data?.attendance || data.attendance.length === 0)) {
       return <SkeletonBlock style={{ height: 170, borderRadius: 20, marginHorizontal: 24 }} />;
     }
     if (criticalAttendance.length > 0) {
@@ -820,10 +1175,10 @@ export default function DashboardScreen() {
 
             <View style={styles.headerBottomRow}>
               <View style={styles.headerMetaGroup}>
-                {profileData?.registerNumber && (
+                {(profileData?.registerNumber || profileData?.registrationNumber) && (
                   <View style={styles.regPill}>
                     <View style={styles.regPillDot} />
-                    <Text style={styles.regPillText}>{profileData.registerNumber}</Text>
+                    <Text style={styles.regPillText}>{profileData.registerNumber || profileData.registrationNumber}</Text>
                   </View>
                 )}
                 <View style={styles.headerSyncPill}>
@@ -862,11 +1217,11 @@ export default function DashboardScreen() {
               </View>
               <View style={styles.heroDivider} />
               <View style={styles.heroChipsRow}>
-                <StatChip icon="library-outline" value={data?.attendance.length || '—'} label="Subjects" accent="#A8B8FF" />
+                <StatChip icon="library-outline" value={data?.attendance?.length ?? '—'} label="Subjects" accent="#A8B8FF" />
                 <View style={styles.heroChipDivider} />
-                <StatChip icon="shield-checkmark-outline" value={data ? `${(data.attendance.length ?? 0) - criticalAttendance.length}` : '—'} label="Safe" accent="#6DEBBF" />
+                <StatChip icon="shield-checkmark-outline" value={data?.attendance ? `${(data.attendance.length ?? 0) - criticalAttendance.length}` : '—'} label="Safe" accent="#6DEBBF" />
                 <View style={styles.heroChipDivider} />
-                <StatChip icon="alert-circle-outline" value={data ? criticalAttendance.length : '—'} label="Alerts" accent="#FFAB7B" />
+                <StatChip icon="alert-circle-outline" value={data?.attendance ? criticalAttendance.length : '—'} label="Alerts" accent="#FFAB7B" />
               </View>
             </LinearGradient>
           </Animated.View>
@@ -876,7 +1231,7 @@ export default function DashboardScreen() {
             <QuickAction icon="clipboard-outline" label="Attendance" color={COLORS.brandLight} tint={COLORS.brandTint} onPress={() => router.push('/attendance')} />
             <QuickAction icon="document-text-outline" label="Marks" color={COLORS.success} tint={COLORS.successTint} onPress={() => router.push('/marks')} />
             <QuickAction icon="calendar-outline" label="Timetable" color={COLORS.warning} tint={COLORS.warningTint} onPress={() => router.push('/Timetable')} />
-            <QuickAction icon="person-outline" label="Profile" color={COLORS.textSecondary} tint={COLORS.divider} onPress={() => router.push('/profile')} />
+            <QuickAction icon="calculator-outline" label="Calc" color={'#8A2BE2'} tint={'#E6E6FA'} onPress={() => router.push('/grade-calculator')} />
           </Animated.View>
 
           {/* TODAY'S ROUTE */}
@@ -920,7 +1275,7 @@ export default function DashboardScreen() {
           <Animated.View entering={FadeInDown.delay(260).springify()} style={styles.bannerOuter}>
             <Image
               source={{ uri: 'https://images.unsplash.com/photo-1522202176988-66273c2fd55f?q=80&w=1000&auto=format&fit=crop' }}
-              style={StyleSheet.absoluteFillObject}
+              style={({ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 })}
               contentFit="cover"
             />
             <LinearGradient colors={['transparent', 'rgba(20,27,59,0.92)']} style={styles.bannerGrad}>
@@ -967,36 +1322,7 @@ export default function DashboardScreen() {
         <FingerprintMenu onClose={() => setIsMenuOpen(false)} onScanStart={() => setIsMenuOpen(true)} />
 
         {/* ─── FIX: SCRAPERS ONLY START AFTER DASHBOARD IS VISIBLE ──── */}
-        {dashboardReady && (
-          <>
-            <SRMTimeTableScraper
-              backgroundMode
-              onScrapeComplete={handleTimetableScrapeComplete}
-              onSessionExpired={handleSessionExpired}
-            />
-            <SRMAcademicReportScraper
-              backgroundMode
-              onScrapeComplete={handleCalendarScrapeComplete}
-            />
-            <SRMAttendanceScraper
-              backgroundMode
-              onScrapeComplete={handleAttendanceScrapeComplete}
-              onSessionExpired={handleSessionExpired}
-            />
-            <SRMMarksScraper
-              backgroundMode
-              onScrapeComplete={handleMarksScrapeComplete}
-              onSessionExpired={handleSessionExpired}
-            />
-            <SRMProfileScraper
-              backgroundMode
-              showInternalAlert={false}
-              skipScrapeIfFresh
-              onScrapeComplete={handleProfileScrapeComplete}
-              onSessionExpired={handleSessionExpired}
-            />
-          </>
-        )}
+        {/* Scrapers have been moved to backend */}
         {/* ─────────────────────────────────────────────────────────── */}
 
       </SafeAreaView>
@@ -1058,13 +1384,13 @@ const styles = StyleSheet.create({
 
   // ── CUSTOM MODALS (LOGOUT & SESSION)
   modalOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     justifyContent: 'center',
     alignItems: 'center',
     zIndex: 1000,
   },
   modalBackdrop: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     backgroundColor: COLORS.overlay,
   },
   modalCard: {
@@ -1528,7 +1854,7 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.12, shadowRadius: 14, elevation: 5,
   },
   bannerGrad: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', padding: 18,
   },
   bannerPill: {

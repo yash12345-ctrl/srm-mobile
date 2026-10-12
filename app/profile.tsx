@@ -6,6 +6,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
+  RefreshControl,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -27,7 +28,7 @@ import ReAnimated, {
 } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import SRMProfileScraper from '../components/SRMProfileScraper';
+import { fetchScrapedData } from '../utils/api';
 
 // ── Palette (unified across app) ─────────────────────────────────────────────
 const C = {
@@ -194,24 +195,59 @@ function useProfileLayout(width: number, height: number) {
 }
 
 // ── Scraper View ─────────────────────────────────────────────────────────────
-// sessionDead prop removed: session expiry now redirects to login immediately
-// via handleSessionExpired, so we never need to reveal the WebView for re-login.
-// showInternalAlert={false}: parent owns all session-expiry UX — no double alert.
-const ProfileScraperView = ({ onSessionExpired, onScrapeComplete }: Readonly<{
-  onSessionExpired: () => void;
+interface StudentProfile {
+  name?: string;
+  registrationNumber?: string;
+  registerNumber?: string;
+  imageUrl?: string;
+  program?: string;
+  department?: string;
+  semester?: string;
+  batch?: string;
+  mobile?: string;
+  enrollmentStatus?: string;
+}
+
+function normalizeProfile(raw: any): StudentProfile | null {
+  if (!raw) return null;
+  const p = raw.profile || raw;
+  const reg = p.registrationNumber || p.registerNumber || p.regNo || '';
+  return {
+    ...p,
+    name: p.name || '',
+    registrationNumber: reg,
+    registerNumber: reg,
+    imageUrl: p.imageUrl || '',
+    program: p.program || '',
+    department: p.department || '',
+    semester: p.semester || '',
+    batch: p.batch || '',
+    mobile: p.mobile || '',
+    enrollmentStatus: p.enrollmentStatus || '',
+  };
+}
+
+// ── Scraper View ─────────────────────────────────────────────────────────────
+const ProfileScraperView = ({ onScrapeComplete, onError }: Readonly<{
   onScrapeComplete: (data: any) => void;
-}>) => (
-  <View style={{ flex: 1, backgroundColor: C.bg }}>
-    <Stack.Screen options={{ title: 'Academia Login', headerBackTitle: 'Back' }} />
-    <LoadingWave />
-    <SRMProfileScraper
-      backgroundMode={true}
-      showInternalAlert={false}
-      onSessionExpired={onSessionExpired}
-      onScrapeComplete={onScrapeComplete}
-    />
-  </View>
-);
+  onError?: (err: any) => void;
+}>) => {
+  useEffect(() => {
+    fetchScrapedData('academia/login')
+      .then(onScrapeComplete)
+      .catch((err) => {
+        console.error(err);
+        onError?.(err);
+      });
+  }, []);
+  
+  return (
+    <View style={{ flex: 1, backgroundColor: C.bg }}>
+      <Stack.Screen options={{ title: 'Academia Login', headerBackTitle: 'Back' }} />
+      <LoadingWave />
+    </View>
+  );
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN SCREEN
@@ -234,45 +270,64 @@ export default function ProfileScreen() {
 
   const [loading, setLoading]             = useState(true);
   const [needsScraping, setNeedsScraping] = useState(false);
+  const [refreshing, setRefreshing]       = useState(false);
   const [netId, setNetId]                 = useState('User');
-  const [profileData, setProfileData]     = useState<{
-    name: string; registerNumber: string; imageUrl: string;
-  } | null>(null);
+  const [profileData, setProfileData]     = useState<StudentProfile | null>(null);
   const [imageError, setImageError]       = useState(false);
-
-  // ✅ Design Issue 1 Fix: guard ref prevents duplicate session-expired firings
-  const hasHandledSessionExpired = useRef(false);
-
-  // ✅ Design Issue 1 Fix: proper session expiry handler — clears cached
-  // academic data and redirects to the app login screen
-  const SESSION_DATA_KEYS = [
-    'academic_data',
-    'timetable_data',
-    'academic_calendar_data',
-    'student_profile_data',
-    'attendance_data_v2',
-  ] as const;
-
-  const handleSessionExpired = useCallback(() => {
-    if (hasHandledSessionExpired.current) return;
-    hasHandledSessionExpired.current = true;
-    // Wipe scraped data; keep user_netid so login screen can greet the user
-    AsyncStorage.multiRemove([...SESSION_DATA_KEYS]).catch(() => {});
-    router.replace('/');
-  }, [router]);
 
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        // Only fetch the netId from storage
-        const storedId = await AsyncStorage.getItem('user_netid');
+        const [storedId, storedProfile, storedAcademia] = await Promise.all([
+          AsyncStorage.getItem('user_netid'),
+          AsyncStorage.getItem('student_profile_data'),
+          AsyncStorage.getItem('academia_data')
+        ]);
         
         if (!alive) return;
         if (storedId) setNetId(storedId);
-        
-        // FORCING THE SCRAPE: Always set needsScraping to true on load
-        setNeedsScraping(true);
+
+        let loadedProfile: StudentProfile | null = null;
+        if (storedProfile) {
+          try {
+            loadedProfile = normalizeProfile(JSON.parse(storedProfile));
+          } catch {}
+        }
+
+        if ((!loadedProfile?.name || !loadedProfile?.registerNumber) && storedAcademia) {
+          try {
+            const fromAcademia = normalizeProfile(JSON.parse(storedAcademia));
+            if (fromAcademia) {
+              loadedProfile = {
+                ...fromAcademia,
+                ...(loadedProfile || {}),
+                name: loadedProfile?.name || fromAcademia.name || '',
+                registerNumber: loadedProfile?.registerNumber || fromAcademia.registerNumber || '',
+                registrationNumber: loadedProfile?.registrationNumber || fromAcademia.registrationNumber || '',
+              };
+            }
+          } catch {}
+        }
+
+        if (loadedProfile && (loadedProfile.name || loadedProfile.registerNumber)) {
+          setProfileData(loadedProfile);
+          setNeedsScraping(false);
+          // Background revalidation from backend (Redis -> DB -> Scraper)
+          fetchScrapedData('academia/login', { forceSync: false })
+            .then((data) => {
+              if (!alive) return;
+              const normalized = normalizeProfile(data);
+              if (normalized) {
+                AsyncStorage.setItem('student_profile_data', JSON.stringify(normalized)).catch(() => {});
+                setProfileData(normalized);
+              }
+            })
+            .catch(() => {});
+        } else {
+          // If no profile found in storage, trigger scrape
+          setNeedsScraping(true);
+        }
 
       } catch (e) {
         console.error(e);
@@ -281,6 +336,22 @@ export default function ProfileScreen() {
       }
     })();
     return () => { alive = false; };
+  }, []);
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const data = await fetchScrapedData('academia/login', { forceSync: true });
+      const normalized = normalizeProfile(data);
+      if (normalized) {
+        await AsyncStorage.setItem('student_profile_data', JSON.stringify(normalized));
+        setProfileData(normalized);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setRefreshing(false);
+    }
   }, []);
 
   if (loading) {
@@ -297,21 +368,27 @@ export default function ProfileScreen() {
   if (needsScraping) {
     return (
       <ProfileScraperView
-        onSessionExpired={handleSessionExpired}
         onScrapeComplete={async (data) => {
-          await AsyncStorage.setItem('student_profile_data', JSON.stringify(data));
-          setProfileData(data);
+          const normalized = normalizeProfile(data);
+          if (normalized) {
+            await AsyncStorage.setItem('student_profile_data', JSON.stringify(normalized));
+            setProfileData(normalized);
+          }
+          setNeedsScraping(false);
+        }}
+        onError={() => {
           setNeedsScraping(false);
         }}
       />
     );
   }
 
-  const displayName = profileData?.name    || 'Student Name';
-  const displayReg  = profileData?.registerNumber || '—';
+  const displayName = profileData?.name    || netId || 'Student Name';
+  const displayReg  = profileData?.registrationNumber || profileData?.registerNumber || '—';
   const avatarUri   = profileData?.imageUrl && !imageError ? profileData.imageUrl : '';
   const avatarInitial = (displayName.trim().charAt(0) || 'S').toUpperCase();
   const displayEmail = netId.includes('@') ? netId : `${netId}@srmist.edu.in`;
+  const displaySemester = profileData?.semester ? `Semester ${profileData.semester}` : (profileData?.enrollmentStatus || 'Active');
 
   return (
     <View style={styles.screen}>
@@ -367,12 +444,15 @@ export default function ProfileScreen() {
       <ScrollView
         contentContainerStyle={[styles.body, { paddingTop: bodyTopInset, paddingHorizontal: hPadding }]}
         showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.brandLight} />
+        }
       >
         <View style={[styles.contentWrapper, { maxWidth: contentMaxWidth }]}>
           
           {/* ── STATS ROW ─────────────────────────────────────────────────── */}
           <ReAnimated.View entering={FadeInDown.delay(80).springify().damping(14).stiffness(100).mass(0.8)} style={[styles.statsCard, { padding: cardPadding }, isVerySmallDevice && styles.statsCardStack]}>
-            <StatTile icon="star-outline"     label="Semester" value="Active"  color="#A05C00"     tint="#FEF3E2"       />
+            <StatTile icon="star-outline"     label="Semester" value={displaySemester}  color="#A05C00"     tint="#FEF3E2"       />
             <View style={[styles.statDivider, isVerySmallDevice && styles.statDividerStack]} />
             <StatTile icon="location-outline" label="Campus"   value="Kattankulathur" color={C.success} tint={C.successTint} />
           </ReAnimated.View>
@@ -390,6 +470,12 @@ export default function ProfileScreen() {
             <InfoRow icon="person-outline" label="Full Name" value={displayName} />
             <InfoRow icon="mail-outline" label="Email / Net ID" value={displayEmail} />
             <InfoRow icon="card-outline" label="Register Number" value={displayReg} />
+            {profileData?.department ? (
+              <InfoRow icon="school-outline" label="Department" value={profileData.department} />
+            ) : null}
+            {profileData?.program ? (
+              <InfoRow icon="book-outline" label="Program" value={profileData.program} />
+            ) : null}
             <InfoRow icon="business-outline" label="Institution" value="SRM Institute of Science and Technology" isLast />
           </ReAnimated.View>
 
@@ -449,7 +535,7 @@ const styles = StyleSheet.create({
   loadingScreen: { flex: 1, backgroundColor: C.bg, justifyContent: 'center', alignItems: 'center' },
 
   loadingWaveContainer: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: C.bg,

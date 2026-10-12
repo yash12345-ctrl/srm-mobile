@@ -1,7 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
+import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
+import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
-import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   Dimensions,
   Image,
@@ -18,13 +20,13 @@ import Animated, {
   interpolate,
   interpolateColor,
   runOnJS,
+  SharedValue,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
   withSequence,
   withSpring,
   withTiming,
-  SharedValue,
 } from 'react-native-reanimated';
 // runOnJS imported from react-native-reanimated (correct for v4 + New Architecture)
 
@@ -36,39 +38,39 @@ const { width, height } = Dimensions.get('window');
 
 // ── Deep navy-on-cream palette (matches upgraded dashboard) ──────────────────
 const COLORS = {
-  white:        '#FFFFFF',
-  bg:           '#F7F4EF',
+  white: '#FFFFFF',
+  bg: '#F7F4EF',
 
   // Brand
-  brand:        '#1E2D6B',
-  brandMid:     '#2A3E96',
-  brandLight:   '#3348B0',
-  brandGlow:    'rgba(30,45,107,0.28)',
+  brand: '#1E2D6B',
+  brandMid: '#2A3E96',
+  brandLight: '#3348B0',
+  brandGlow: 'rgba(30,45,107,0.28)',
 
   // Text
-  textDark:     '#12141C',
-  textMuted:    '#5A5E6B',
-  textFaint:    '#9299A8',
+  textDark: '#12141C',
+  textMuted: '#5A5E6B',
+  textFaint: '#9299A8',
 
   // Semantic
-  danger:       '#C0290A',
-  dangerMid:    '#E84422',
-  dangerGlow:   'rgba(192,41,10,0.35)',
+  danger: '#C0290A',
+  dangerMid: '#E84422',
+  dangerGlow: 'rgba(192,41,10,0.35)',
 
   // Surface
-  surface:      '#FFFFFF',
-  surfaceWarm:  '#FEFCF9',
-  border:       '#E6E1D6',
-  overlay:      'rgba(12,16,36,0.88)',
+  surface: '#FFFFFF',
+  surfaceWarm: '#FEFCF9',
+  border: '#E6E1D6',
+  overlay: 'rgba(12,16,36,0.88)',
 
   // Accent beam
-  beam:         '#60A5FA',
-  beamGlow:     'rgba(96,165,250,0.8)',
+  beam: '#60A5FA',
+  beamGlow: 'rgba(96,165,250,0.8)',
 } as const;
 
-const FAB_SIZE   = 58;
-const RING_SIZE  = FAB_SIZE + 28;
-const MENU_R     = width * 0.33;
+const FAB_SIZE = 58;
+const RING_SIZE = FAB_SIZE + 28;
+const MENU_R = width * 0.33;
 
 // ==========================================
 // 2. MENU CONFIGURATION & PUNCHLINES
@@ -83,12 +85,12 @@ interface MenuItemProps {
 }
 
 const COMBINED_MENU: MenuItemProps[] = [
-  { icon: 'calendar',    label: 'Calendar',   route: '/calendar',   color: '#3348B0', tint: '#E8ECFB' },
-  { icon: 'time',        label: 'Timetable',  route: '/Timetable',  color: '#0E7A4A', tint: '#E5F5EE' },
-  { icon: 'calculator',  label: 'Grades',     route: '/grades',     color: '#A05C00', tint: '#FEF3E2' },
-  { icon: 'library',     label: 'Resources',  route: '/resources',  color: '#6B21A8', tint: '#F3E8FF' },
-  { icon: 'mail',        label: 'Gmail',      route: '/gmail',      color: '#C0290A', tint: '#FDECEA' },
-  { icon: 'restaurant',  label: 'Mess',       route: '/mess',       color: '#0369A1', tint: '#E0F2FE' },
+  { icon: 'calendar', label: 'Calendar', route: '/calendar', color: '#3348B0', tint: '#E8ECFB' },
+  { icon: 'time', label: 'Timetable', route: '/Timetable', color: '#0E7A4A', tint: '#E5F5EE' },
+  { icon: 'calculator', label: 'Grades', route: '/grade-calculator', color: '#A05C00', tint: '#FEF3E2' },
+  { icon: 'library', label: 'Resources', route: '/resources', color: '#6B21A8', tint: '#F3E8FF' },
+  { icon: 'people', label: 'Faculty Finder', route: '/faculty-finder', color: '#0D9488', tint: '#CCFBF1' },
+  { icon: 'restaurant', label: 'Mess', route: '/mess', color: '#0369A1', tint: '#E0F2FE' },
 ];
 
 const CRAZY_MESSAGES = [
@@ -103,10 +105,8 @@ const CRAZY_MESSAGES = [
   "No good decision is made in Pondi. 🍻",
   "A moment of silence for Raptors! 🫡",
   "Petition to diversify Tascmac menu.",
-  "The only STEP I like is stepsister. 😏",
   "STEP hatwado koi! 😭",
   "Shawty said she was from Estancia; turns out Mini Matrix ki thi. 🤡",
-  "Sirf hostel wali akka hi mujhe dekh ke seeti marti hai. 😙🎶",
   "Forest vs. Blackfilter—which side are you on?",
   "HR05 shutting down is my biggest nightmare."
 ];
@@ -123,13 +123,13 @@ const RadialMenuItem = memo(({
   expansion: SharedValue<number>;
   onPress: () => void;
 }) => {
-  const angle   = Math.PI - (index * (Math.PI / (totalItems - 1)));
+  const angle = Math.PI - (index * (Math.PI / (totalItems - 1)));
   const targetX = Math.cos(angle) * MENU_R;
   const targetY = -Math.sin(angle) * MENU_R;
 
   const animatedStyle = useAnimatedStyle(() => {
-    const staggerStart   = index * (0.25 / totalItems);
-    const itemProgress   = interpolate(
+    const staggerStart = index * (0.25 / totalItems);
+    const itemProgress = interpolate(
       expansion.value,
       [staggerStart, staggerStart + 0.75],
       [0, 1],
@@ -147,7 +147,7 @@ const RadialMenuItem = memo(({
   });
 
   const color = item.isDanger ? COLORS.danger : (item.color ?? COLORS.brand);
-  const tint  = item.tint ?? '#F0F0F0';
+  const tint = item.tint ?? '#F0F0F0';
 
   return (
     <Animated.View style={[styles.radialItemWrap, animatedStyle]}>
@@ -193,28 +193,28 @@ const ProgressRing = memo(({ progress }: { progress: SharedValue<number> }) => {
 // 5. MAIN COMPONENT
 // ==========================================
 export default function FingerprintMenu({ onClose, onScanStart }: { readonly onClose: () => void, readonly onScanStart: () => void }) {
-  const [isScanning, setIsScanning]   = useState(false);
-  const [isOpen, setIsOpen]           = useState(false);
-  const hapticInterval                = useRef<ReturnType<typeof setInterval> | null>(null);
-  const scanSuccess                   = useRef(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [isOpen, setIsOpen] = useState(false);
+  const hapticInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const scanSuccess = useRef(false);
 
   // Chat state
-  const [isThinking, setIsThinking]   = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
   const [fullMessage, setFullMessage] = useState('Where to?');
   const [agentMessage, setAgentMessage] = useState('');
   const [thinkingDots, setThinkingDots] = useState('');
 
   // Toast State
   const [toastFeature, setToastFeature] = useState('');
-  const toastTimer                      = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const toastAnim                       = useSharedValue(0);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastAnim = useSharedValue(0);
 
   // Shared values
-  const scanProgress  = useSharedValue(0);
-  const expansion     = useSharedValue(0);
-  const laserPos      = useSharedValue(0);
-  const hoverAnim     = useSharedValue(0);
-  const pulseRing     = useSharedValue(0);
+  const scanProgress = useSharedValue(0);
+  const expansion = useSharedValue(0);
+  const laserPos = useSharedValue(0);
+  const hoverAnim = useSharedValue(0);
+  const pulseRing = useSharedValue(0);
 
   // ── Thinking dots ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -274,7 +274,7 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
   const laserStyle = useAnimatedStyle(() => ({
     transform: [
       { translateY: interpolate(laserPos.value, [0, 1], [-16, 16]) },
-      { scaleX:     interpolate(laserPos.value, [0, 0.5, 1], [0.5, 1, 0.5]) },
+      { scaleX: interpolate(laserPos.value, [0, 0.5, 1], [0.5, 1, 0.5]) },
     ],
     opacity: isScanning && !isOpen ? interpolate(laserPos.value, [0, 0.5, 1], [0.4, 1, 0.4]) : 0,
   }));
@@ -282,23 +282,23 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
   const spinnerStyle = useAnimatedStyle(() => ({
     transform: [
       { rotate: `${interpolate(scanProgress.value, [0, 1], [0, 380])}deg` },
-      { scale:   interpolate(scanProgress.value, [0, 0.1, 1], [0.7, 1.25, 1.35], Extrapolation.CLAMP) },
+      { scale: interpolate(scanProgress.value, [0, 0.1, 1], [0.7, 1.25, 1.35], Extrapolation.CLAMP) },
     ],
     opacity: interpolate(scanProgress.value, [0, 0.08, 1], [0, 1, 0]),
   }));
 
   const pulseRingStyle = useAnimatedStyle(() => ({
     transform: [{ scale: interpolate(pulseRing.value, [0, 1], [1, 1.8]) }],
-    opacity:   interpolate(pulseRing.value, [0, 0.5, 1], [0.6, 0.2, 0]),
+    opacity: interpolate(pulseRing.value, [0, 0.5, 1], [0.6, 0.2, 0]),
   }));
 
   const chatStyle = useAnimatedStyle(() => {
     const hover = interpolate(hoverAnim.value, [0, 1], [0, -7]);
     return {
-      opacity:   interpolate(expansion.value, [0.4, 1], [0, 1], Extrapolation.CLAMP),
+      opacity: interpolate(expansion.value, [0.4, 1], [0, 1], Extrapolation.CLAMP),
       transform: [
         { translateY: interpolate(expansion.value, [0, 1], [50, 0], Extrapolation.CLAMP) + hover },
-        { scale:      interpolate(expansion.value, [0.4, 1], [0.88, 1], Extrapolation.CLAMP) },
+        { scale: interpolate(expansion.value, [0.4, 1], [0.88, 1], Extrapolation.CLAMP) },
       ],
     };
   });
@@ -334,7 +334,7 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
       ticks++;
       if (ticks % 2 === 0) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     }, 140);
-    laserPos.value     = withRepeat(withTiming(1, { duration: 340 }), -1, true);
+    laserPos.value = withRepeat(withTiming(1, { duration: 340 }), -1, true);
     scanProgress.value = withTiming(1, { duration: 800 }, (done) => {
       if (done) {
         runOnJS(triggerOpenMenu)(); // NOSONAR
@@ -349,7 +349,7 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
       cancelAnimation(scanProgress);
       cancelAnimation(laserPos);
       scanProgress.value = withTiming(0, { duration: 300 });
-      laserPos.value     = withTiming(0, { duration: 300 });
+      laserPos.value = withTiming(0, { duration: 300 });
       setIsScanning(false);
       onClose();
     }
@@ -357,12 +357,16 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
 
   const handlePress = () => {
     if (scanSuccess.current) { scanSuccess.current = false; return; }
-    if (isOpen) handleClose();
+    if (isOpen) {
+      handleClose();
+    } else {
+      triggerOpenMenu();
+    }
   };
 
   const handleClose = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    expansion.value    = withTiming(0, { duration: 240 });
+    expansion.value = withTiming(0, { duration: 240 });
     scanProgress.value = withTiming(0, { duration: 240 });
     setTimeout(() => { setIsOpen(false); onClose(); }, 240);
   }, [expansion, scanProgress, onClose]);
@@ -372,7 +376,7 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
     setToastFeature(feature);
     toastAnim.value = withSpring(1, { damping: 14, stiffness: 100 });
-    
+
     toastTimer.current = setTimeout(() => {
       toastAnim.value = withTiming(0, { duration: 300 });
     }, 3500);
@@ -381,7 +385,7 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
   const handleNavigation = useCallback((route?: string, label?: string) => {
     if (!route) return;
 
-    if (route === '/calendar' || route === '/Timetable') {
+    if (route === '/calendar' || route === '/Timetable' || route === '/grade-calculator') {
       handleClose();
       setTimeout(() => router.push(route as any), 280);
     } else {
@@ -398,7 +402,13 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
   if (isScanning && !isOpen) fabIconSize = 30;
 
   return (
-    <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+    <View
+      style={[
+        StyleSheet.absoluteFill,
+        isOpen && { zIndex: 99, elevation: 99 }
+      ]}
+      pointerEvents="box-none"
+    >
 
       {/* ── CUSTOM TOAST (Coming Soon) ───────────────────────────────────── */}
       <Animated.View style={[styles.toastContainer, toastStyle]} pointerEvents="none">
@@ -411,12 +421,19 @@ export default function FingerprintMenu({ onClose, onScanStart }: { readonly onC
         </View>
       </Animated.View>
 
-      {/* ── BOTTOM BAR MASK (Hides the bottom white tab bar) ── */}
-      <Animated.View style={[styles.bottomMask, backdropStyle]} pointerEvents="none" />
-
-      {/* ── BACKDROP ─────────────────────────────────────────────────────── */}
+      {/* ── GLASSMORPHIC BACKDROP ────────────────────────────────────────── */}
       <Animated.View style={[styles.backdrop, backdropStyle]} pointerEvents={isOpen ? 'auto' : 'none'}>
-        <Pressable style={StyleSheet.absoluteFill} onPress={handleClose} />
+        <Pressable style={styles.backdropPressable} onPress={handleClose}>
+          <BlurView
+            intensity={75}
+            tint="dark"
+            style={StyleSheet.absoluteFill}
+          />
+          <LinearGradient
+            colors={['rgba(20, 27, 59, 0.45)', 'rgba(10, 15, 35, 0.70)']}
+            style={StyleSheet.absoluteFill}
+          />
+        </Pressable>
       </Animated.View>
 
       {/* ── CHAT BUBBLE ──────────────────────────────────────────────────── */}
@@ -577,21 +594,23 @@ const styles = StyleSheet.create({
   },
 
   // ── BOTTOM BAR MASK (Hides the bottom white tab bar)
-  bottomMask: {
+  // ── GLASSMORPHIC BACKDROP
+  backdrop: {
     position: 'absolute',
-    bottom: -100,
+    top: 0,
     left: 0,
     right: 0,
-    height: 250,
-    backgroundColor: COLORS.bg,
-    zIndex: 5,
-  },
-
-  // ── BACKDROP
-  backdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: COLORS.overlay,
+    bottom: 0,
     zIndex: 10,
+    elevation: 10,
+    overflow: 'hidden',
+  },
+  backdropPressable: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
   },
 
   // ── CHAT BUBBLE
@@ -604,7 +623,7 @@ const styles = StyleSheet.create({
     zIndex: 25,
   },
   chatCard: {
-    backgroundColor: COLORS.surface,
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
     borderRadius: 24,
     paddingHorizontal: 20,
     paddingTop: 0,
@@ -716,7 +735,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
     borderLeftColor: 'transparent',
     borderRightColor: 'transparent',
-    borderTopColor: COLORS.surface,
+    borderTopColor: 'rgba(255, 255, 255, 0.95)',
   },
 
   // ── ANCHOR
@@ -869,16 +888,16 @@ const styles = StyleSheet.create({
     width: 52,
     height: 52,
     borderRadius: 18,
-    backgroundColor: COLORS.surface,
+    backgroundColor: 'rgba(255, 255, 255, 0.94)',
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 7,
     shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.22,
-    shadowRadius: 12,
+    shadowOpacity: 0.25,
+    shadowRadius: 14,
     elevation: 10,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.9)',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255, 255, 255, 0.85)',
   },
   radialItemPressed: {
     transform: [{ scale: 0.93 }],

@@ -1,12 +1,16 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
-import { Stack } from 'expo-router';
+import { DarkTheme, DefaultTheme, ThemeProvider } from "expo-router/react-navigation";
+import { Stack, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import React from 'react';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import React, { useCallback, useRef, useState, useEffect } from 'react';
+import { StyleSheet, Text, TouchableOpacity, View, LogBox } from 'react-native';
 import 'react-native-reanimated';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+LogBox.ignoreLogs([
+  "Can't perform a React state update on a component that hasn't mounted yet",
+]);
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
-
 // ─── Global Error Boundary ────────────────────────────────────────────────────
 // Catches any unhandled React render errors and shows a friendly screen
 // instead of letting them bubble to native and trigger the OS "force stop" dialog.
@@ -61,17 +65,44 @@ const eb = StyleSheet.create({
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const unstable_settings = {
-  anchor: '(tabs)',
+  initialRouteName: 'login/index',
 };
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
+  const router = useRouter();
+  const hasHandledSessionExpired = useRef(false);
+
+  const SESSION_DATA_KEYS = [
+    'academic_data',
+    'timetable_data',
+    'academic_calendar_data',
+    'student_profile_data',
+    'attendance_data_v2',
+    'attendance_data',
+    'portal_password',
+    'grades_data',
+    'session_active'
+  ] as const;
+
+  const handleGlobalSessionDeath = useCallback(() => {
+    if (hasHandledSessionExpired.current) return;
+    hasHandledSessionExpired.current = true;
+    
+    // Wipe scraped data; keep user_netid so login screen can greet the user
+    AsyncStorage.multiRemove([...SESSION_DATA_KEYS]).catch(() => {});
+    
+    // Hard redirect to login screen
+    router.replace('/login');
+  }, [router]);
 
   return (
     <AppErrorBoundary>
       <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+        
         <Stack>
           <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+          <Stack.Screen name="login/index" options={{ headerShown: false }} />
           <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
         </Stack>
         <StatusBar style="auto" />
